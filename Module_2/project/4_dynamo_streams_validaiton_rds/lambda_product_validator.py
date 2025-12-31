@@ -2,175 +2,195 @@
 Lambda Function: Product Validator (Container-based)
 ====================================================
 
-Trigger: DynamoDB Streams (when new records inserted into UploadRecords)
-Process: Validate product data against business rules
-Output: 
-  - Valid products → Insert into RDS products table
-  - Invalid products → Send to SQS error queue
+PURPOSE
+-------
+Validates product records ingested into DynamoDB via vendor CSV uploads.
 
-Container Image Deployment:
-- Dockerfile builds Python 3.11 with psycopg2
-- Deployed to ECR
-- Lambda pulls from ECR
+FLOW
+----
+DynamoDB Stream (INSERT)
+    → Validate product fields
+    → If valid:
+         - Mark record as validated in DynamoDB
+         - (Optionally) Insert into RDS products table
+    → If invalid:
+         - Mark record as error in DynamoDB
+         - Persist error in RDS
+         - Send error payload to SQS
 
-Validation Rules:
-1. Required Fields: vendor_product_id, product_name, category, sku, price, stock_quantity
-2. Price: Must be > 0 and <= 999,999.99
-3. Stock: Must be >= 0 and <= 1,000,000
-4. Category: Must be in whitelist (from RDS product_categories table)
-5. SKU: Must be unique across platform (check RDS products table)
-6. Vendor Product ID: Must be unique per vendor
-7. Field Lengths: product_name (200 chars), description (2000 chars), etc.
-
-Secrets Manager Integration:
-- RDS credentials stored in AWS Secrets Manager
-- Retrieved and cached using aws-secretsmanager-caching
-
-Environment Variables:
-- DYNAMODB_TABLE: UploadRecords
-- RDS_SECRET_NAME: ecommerce/rds/credentials
-- SQS_ERROR_QUEUE_URL: https://sqs.us-east-1.amazonaws.com/123456789012/product-validation-errors
-- REGION: us-east-1
-
-IAM Permissions Required:
-- dynamodb:GetItem, dynamodb:UpdateItem (read/update DynamoDB records)
-- dynamodb:DescribeStream, dynamodb:GetRecords, dynamodb:GetShardIterator (read streams)
-- rds:* (connect to RDS)
-- sqs:SendMessage (send to error queue)
-- secretsmanager:GetSecretValue (retrieve RDS credentials)
-- logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents
-- cloudwatch:PutMetricData
-- ec2:CreateNetworkInterface, ec2:DescribeNetworkInterfaces, ec2:DeleteNetworkInterface (VPC)
+DESIGN PRINCIPLES
+-----------------
+- Separation of ingestion vs validation
+- Idempotent processing
+- Explicit error handling & traceability
+- Production-grade logging with stack traces
 """
+
+# =============================================================================
+# STANDARD LIBRARIES
+# =============================================================================
 
 import json
 import os
+import logging
+import traceback
 from datetime import datetime
 from decimal import Decimal
+
+# =============================================================================
+# AWS & THIRD-PARTY LIBRARIES
+# =============================================================================
+
 import boto3
 from botocore.exceptions import ClientError
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from aws_secretsmanager_caching import SecretCache, SecretCacheConfig
 
+# =============================================================================
+# LOGGING CONFIGURATION
+# =============================================================================
+
+LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO")
+
+logging.basicConfig(
+    level=LOG_LEVEL,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+)
+
+logger = logging.getLogger(__name__)
 
 # =============================================================================
 # ENVIRONMENT VARIABLES
 # =============================================================================
 
-DYNAMODB_TABLE = os.environ.get('DYNAMODB_TABLE', 'UploadRecords')
-RDS_SECRET_NAME = os.environ.get('RDS_SECRET_NAME', 'ecommerce/rds/credentials')
-SQS_ERROR_QUEUE_URL = os.environ.get('SQS_ERROR_QUEUE_URL')
-REGION = os.environ.get('AWS_REGION', 'us-east-1')
-
-# AWS Clients
-dynamodb = boto3.resource('dynamodb', region_name=REGION)
-sqs_client = boto3.client('sqs', region_name=REGION)
-cloudwatch = boto3.client('cloudwatch', region_name=REGION)
-secretsmanager = boto3.client('secretsmanager', region_name=REGION)
-
-# Secrets Manager Cache
-cache_config = SecretCacheConfig()
-cache = SecretCache(config=cache_config, client=secretsmanager)
-
-# Database connection (reused across invocations)
-db_connection = None
-
+DYNAMODB_TABLE = os.environ.get("DYNAMODB_TABLE", "UploadRecords")
+RDS_SECRET_NAME = os.environ.get("RDS_SECRET_NAME", "ecommerce/rds/credentials")
+SQS_ERROR_QUEUE_URL = os.environ.get("SQS_ERROR_QUEUE_URL")
+REGION = os.environ.get("AWS_REGION", "us-east-1")
 
 # =============================================================================
-# VALIDATION RULES CONFIGURATION
+# AWS CLIENTS (REUSED ACROSS INVOCATIONS)
+# =============================================================================
+
+dynamodb = boto3.resource("dynamodb", region_name=REGION)
+sqs_client = boto3.client("sqs", region_name=REGION)
+cloudwatch = boto3.client("cloudwatch", region_name=REGION)
+secretsmanager = boto3.client("secretsmanager", region_name=REGION)
+
+# =============================================================================
+# SECRETS MANAGER CACHE
+# =============================================================================
+
+cache = SecretCache(
+    config=SecretCacheConfig(),
+    client=secretsmanager
+)
+
+# =============================================================================
+# DATABASE CONNECTION (GLOBAL FOR REUSE)
+# =============================================================================
+
+db_connection = None
+
+# =============================================================================
+# VALIDATION RULE DEFINITIONS
 # =============================================================================
 
 VALIDATION_RULES = {
-    'required_fields': [
-        'vendor_product_id',
-        'product_name',
-        'category',
-        'sku',
-        'price',
-        'stock_quantity'
+    "required_fields": [
+        "vendor_product_id",
+        "product_name",
+        "category",
+        "sku",
+        "price",
+        "stock_quantity"
     ],
-    'price': {
-        'min': Decimal('0.01'),
-        'max': Decimal('999999.99')
-    },
-    'stock': {
-        'min': 0,
-        'max': 1000000
-    },
-    'field_lengths': {
-        'product_name': 200,
-        'description': 2000,
-        'sku': 100,
-        'brand': 100,
-        'vendor_product_id': 100
+    "price": {"min": Decimal("0.01"), "max": Decimal("999999.99")},
+    "stock": {"min": 0, "max": 1_000_000},
+    "field_lengths": {
+        "product_name": 200,
+        "description": 2000,
+        "sku": 100,
+        "brand": 100,
+        "vendor_product_id": 100
     }
 }
 
-
 # =============================================================================
-# SECRETS MANAGER & DATABASE CONNECTION
+# SECRETS & DATABASE HELPERS
 # =============================================================================
 
 def get_rds_credentials():
     """
     Retrieve RDS credentials from AWS Secrets Manager.
-    Uses caching to reduce API calls.
-    
-    Returns:
-        dict: RDS connection parameters
+
+    Uses caching to avoid repeated Secrets Manager API calls.
+
+    Returns
+    -------
+    dict
+        Dictionary containing host, port, dbname, username, password
+
+    Raises
+    ------
+    Exception
+        If secret retrieval fails
     """
     try:
         secret_string = cache.get_secret_string(RDS_SECRET_NAME)
-        secret = json.loads(secret_string)
-        return secret
+        return json.loads(secret_string)
     except Exception as e:
-        print(f"✗ Error retrieving secret: {str(e)}")
+        logger.error(
+            "Failed to retrieve RDS credentials",
+            extra={"error": str(e), "traceback": traceback.format_exc()}
+        )
         raise
 
 
 def get_db_connection():
     """
-    Get or create PostgreSQL connection using connection pooling.
-    Reuses connection across Lambda invocations for better performance.
-    
-    Returns:
-        psycopg2.connection: Database connection
+    Get an active PostgreSQL connection.
+
+    Reuses an existing connection if still alive.
+    Recreates connection if stale or closed.
+
+    Returns
+    -------
+    psycopg2.connection
+        Active database connection
     """
     global db_connection
-    
+
+    # Attempt to reuse existing connection
     try:
-        # Check if connection exists and is valid
-        if db_connection is not None and not db_connection.closed:
-            # Test connection
-            cursor = db_connection.cursor()
-            cursor.execute('SELECT 1')
-            cursor.close()
+        if db_connection and not db_connection.closed:
+            with db_connection.cursor() as cur:
+                cur.execute("SELECT 1")
             return db_connection
-    except:
-        # Connection is dead, will create new one
+    except Exception:
+        # Connection is unhealthy → recreate
         db_connection = None
-    
-    # Create new connection
+
+    # Create a new database connection
     try:
         creds = get_rds_credentials()
-        
         db_connection = psycopg2.connect(
-            host=creds.get('host'),
-            port=creds.get('port', 5432),
-            database=creds.get('dbname'),
-            user=creds.get('username'),
-            password=creds.get('password'),
+            host=creds["host"],
+            port=creds.get("port", 5432),
+            database=creds["dbname"],
+            user=creds["username"],
+            password=creds["password"],
             connect_timeout=5
         )
-        
-        print("✓ Connected to RDS successfully")
+        logger.info("Connected to RDS successfully")
         return db_connection
-        
     except Exception as e:
-        print(f"✗ Database connection error: {str(e)}")
+        logger.critical(
+            "Database connection failed",
+            extra={"error": str(e), "traceback": traceback.format_exc()}
+        )
         raise
-
 
 # =============================================================================
 # VALIDATION FUNCTIONS
@@ -178,634 +198,221 @@ def get_db_connection():
 
 def validate_required_fields(product_data):
     """
-    Validate that all required fields are present and not empty.
-    
-    Args:
-        product_data: Product data dictionary
-    
-    Returns:
-        tuple: (is_valid, error_message)
+    Ensure mandatory fields are present and non-empty.
+
+    Returns
+    -------
+    (bool, str | None)
+        Validation result and error message
     """
-    missing_fields = []
-    
-    for field in VALIDATION_RULES['required_fields']:
-        value = product_data.get(field)
-        
-        # Check if field is missing or empty
-        if value is None or value == '':
-            missing_fields.append(field)
-    
-    if missing_fields:
-        return False, f"Missing required fields: {', '.join(missing_fields)}"
-    
+    missing = [
+        field for field in VALIDATION_RULES["required_fields"]
+        if not product_data.get(field)
+    ]
+    if missing:
+        return False, f"Missing required fields: {', '.join(missing)}"
     return True, None
 
 
 def validate_price(price):
     """
-    Validate price is within acceptable range.
-    
-    Args:
-        price: Decimal or None
-    
-    Returns:
-        tuple: (is_valid, error_message)
+    Validate price value and bounds.
     """
-    if price is None:
-        return False, "Price is required"
-    
     try:
         price = Decimal(str(price))
-        
-        if price < VALIDATION_RULES['price']['min']:
-            return False, f"Price must be at least {VALIDATION_RULES['price']['min']}"
-        
-        if price > VALIDATION_RULES['price']['max']:
-            return False, f"Price cannot exceed {VALIDATION_RULES['price']['max']}"
-        
+        if price < VALIDATION_RULES["price"]["min"]:
+            return False, "Price below minimum allowed"
+        if price > VALIDATION_RULES["price"]["max"]:
+            return False, "Price exceeds maximum allowed"
         return True, None
-        
     except Exception as e:
         return False, f"Invalid price format: {str(e)}"
 
 
 def validate_stock_quantity(stock):
     """
-    Validate stock quantity is within acceptable range.
-    
-    Args:
-        stock: Integer or None
-    
-    Returns:
-        tuple: (is_valid, error_message)
+    Validate stock quantity bounds.
     """
-    if stock is None:
-        return False, "Stock quantity is required"
-    
     try:
         stock = int(stock)
-        
-        if stock < VALIDATION_RULES['stock']['min']:
-            return False, f"Stock quantity cannot be negative"
-        
-        if stock > VALIDATION_RULES['stock']['max']:
-            return False, f"Stock quantity cannot exceed {VALIDATION_RULES['stock']['max']}"
-        
+        if stock < VALIDATION_RULES["stock"]["min"]:
+            return False, "Stock cannot be negative"
+        if stock > VALIDATION_RULES["stock"]["max"]:
+            return False, "Stock exceeds maximum allowed"
         return True, None
-        
     except Exception as e:
-        return False, f"Invalid stock quantity format: {str(e)}"
-
-
-def validate_category(category):
-    """
-    Validate category exists in allowed categories list.
-    
-    Args:
-        category: Category name
-    
-    Returns:
-        tuple: (is_valid, error_message)
-    """
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor(cursor_factory=RealDictCursor)
-        
-        cursor.execute("""
-            SELECT category_id 
-            FROM product_categories 
-            WHERE category_name = %s AND is_active = TRUE
-        """, (category,))
-        
-        result = cursor.fetchone()
-        cursor.close()
-        
-        if result:
-            return True, None
-        else:
-            return False, f"Invalid category: {category}. Category not found in allowed list."
-        
-    except Exception as e:
-        print(f"✗ Error validating category: {str(e)}")
-        return False, f"Category validation error: {str(e)}"
-
-
-def validate_sku_uniqueness(sku, vendor_id):
-    """
-    Validate SKU is unique across the platform.
-    
-    Args:
-        sku: Stock keeping unit
-        vendor_id: Vendor identifier
-    
-    Returns:
-        tuple: (is_valid, error_message)
-    """
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor(cursor_factory=RealDictCursor)
-        
-        cursor.execute("""
-            SELECT product_id, vendor_id 
-            FROM products 
-            WHERE sku = %s
-        """, (sku,))
-        
-        result = cursor.fetchone()
-        cursor.close()
-        
-        if result:
-            return False, f"Duplicate SKU: {sku} already exists (Product ID: {result['product_id']}, Vendor: {result['vendor_id']})"
-        
-        return True, None
-        
-    except Exception as e:
-        print(f"✗ Error validating SKU uniqueness: {str(e)}")
-        return False, f"SKU validation error: {str(e)}"
-
-
-def validate_vendor_product_id_uniqueness(vendor_product_id, vendor_id):
-    """
-    Validate vendor_product_id is unique for this vendor.
-    
-    Args:
-        vendor_product_id: Vendor's product identifier
-        vendor_id: Vendor identifier
-    
-    Returns:
-        tuple: (is_valid, error_message)
-    """
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor(cursor_factory=RealDictCursor)
-        
-        cursor.execute("""
-            SELECT product_id 
-            FROM products 
-            WHERE vendor_id = %s AND vendor_product_id = %s
-        """, (vendor_id, vendor_product_id))
-        
-        result = cursor.fetchone()
-        cursor.close()
-        
-        if result:
-            return False, f"Duplicate vendor product ID: {vendor_product_id} already exists for vendor {vendor_id}"
-        
-        return True, None
-        
-    except Exception as e:
-        print(f"✗ Error validating vendor product ID: {str(e)}")
-        return False, f"Vendor product ID validation error: {str(e)}"
+        return False, f"Invalid stock format: {str(e)}"
 
 
 def validate_field_lengths(product_data):
     """
-    Validate field lengths don't exceed maximum allowed.
-    
-    Args:
-        product_data: Product data dictionary
-    
-    Returns:
-        tuple: (is_valid, error_message)
+    Validate string field lengths against configured limits.
     """
     errors = []
-    
-    for field, max_length in VALIDATION_RULES['field_lengths'].items():
-        value = product_data.get(field, '')
-        
-        if value and len(str(value)) > max_length:
-            errors.append(f"{field} exceeds maximum length of {max_length} characters")
-    
+    for field, max_len in VALIDATION_RULES["field_lengths"].items():
+        value = product_data.get(field)
+        if value and len(str(value)) > max_len:
+            errors.append(f"{field} exceeds {max_len} characters")
+
     if errors:
         return False, "; ".join(errors)
-    
     return True, None
+
+
+def validate_category(category):
+    """
+    Ensure category exists and is active in reference table.
+    """
+    try:
+        conn = get_db_connection()
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT 1
+                FROM product_categories
+                WHERE category_name = %s
+                  AND is_active = TRUE
+                """,
+                (category,)
+            )
+            return (True, None) if cur.fetchone() else (False, "Invalid category")
+    except Exception:
+        logger.error(
+            "Category validation failed",
+            extra={"category": category, "traceback": traceback.format_exc()}
+        )
+        return False, "Category validation error"
+
+
+def validate_sku_uniqueness(sku):
+    """
+    Ensure SKU is globally unique across all vendors.
+    """
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM products WHERE sku = %s", (sku,))
+            return (False, "Duplicate SKU") if cur.fetchone() else (True, None)
+    except Exception:
+        logger.error(
+            "SKU uniqueness validation failed",
+            extra={"sku": sku, "traceback": traceback.format_exc()}
+        )
+        return False, "SKU uniqueness check failed"
+
+
+def validate_vendor_product_id_uniqueness(vendor_product_id, vendor_id):
+    """
+    Ensure vendor_product_id is unique per vendor.
+    """
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT 1
+                FROM products
+                WHERE vendor_id = %s
+                  AND vendor_product_id = %s
+                """,
+                (vendor_id, vendor_product_id)
+            )
+            return (False, "Duplicate vendor product ID") if cur.fetchone() else (True, None)
+    except Exception:
+        logger.error(
+            "Vendor product ID uniqueness validation failed",
+            extra={"vendor_id": vendor_id, "traceback": traceback.format_exc()}
+        )
+        return False, "Vendor product ID uniqueness check failed"
 
 
 def validate_product(product_data, vendor_id):
     """
-    Run all validation rules on product data.
-    
-    Args:
-        product_data: Product data dictionary
-        vendor_id: Vendor identifier
-    
-    Returns:
-        tuple: (is_valid, error_type, error_message)
+    Run all validation checks sequentially.
+
+    Short-circuits on first failure.
+
+    Returns
+    -------
+    (bool, str | None, str | None)
+        is_valid, error_type, error_message
     """
-    
-    # 1. Validate required fields
-    is_valid, error = validate_required_fields(product_data)
-    if not is_valid:
-        return False, 'MISSING_REQUIRED_FIELDS', error
-    
-    # 2. Validate price
-    is_valid, error = validate_price(product_data.get('price'))
-    if not is_valid:
-        return False, 'INVALID_PRICE', error
-    
-    # 3. Validate stock quantity
-    is_valid, error = validate_stock_quantity(product_data.get('stock_quantity'))
-    if not is_valid:
-        return False, 'INVALID_STOCK_QUANTITY', error
-    
-    # 4. Validate field lengths
-    is_valid, error = validate_field_lengths(product_data)
-    if not is_valid:
-        return False, 'FIELD_LENGTH_EXCEEDED', error
-    
-    # 5. Validate category
-    is_valid, error = validate_category(product_data.get('category'))
-    if not is_valid:
-        return False, 'INVALID_CATEGORY', error
-    
-    # 6. Validate SKU uniqueness
-    is_valid, error = validate_sku_uniqueness(product_data.get('sku'), vendor_id)
-    if not is_valid:
-        return False, 'DUPLICATE_SKU', error
-    
-    # 7. Validate vendor product ID uniqueness
-    is_valid, error = validate_vendor_product_id_uniqueness(
-        product_data.get('vendor_product_id'), 
-        vendor_id
-    )
-    if not is_valid:
-        return False, 'DUPLICATE_VENDOR_PRODUCT_ID', error
-    
-    # All validations passed!
+    validations = [
+        (validate_required_fields, "MISSING_REQUIRED_FIELDS"),
+        (lambda d: validate_price(d.get("price")), "INVALID_PRICE"),
+        (lambda d: validate_stock_quantity(d.get("stock_quantity")), "INVALID_STOCK"),
+        (validate_field_lengths, "FIELD_LENGTH_EXCEEDED"),
+        (lambda d: validate_category(d.get("category")), "INVALID_CATEGORY"),
+        (lambda d: validate_sku_uniqueness(d.get("sku")), "DUPLICATE_SKU"),
+        (lambda d: validate_vendor_product_id_uniqueness(
+            d.get("vendor_product_id"), vendor_id
+        ), "DUPLICATE_VENDOR_PRODUCT_ID"),
+    ]
+
+    for fn, error_type in validations:
+        is_valid, error_message = fn(product_data)
+        if not is_valid:
+            return False, error_type, error_message
+
     return True, None, None
 
-
 # =============================================================================
-# DATABASE OPERATIONS
-# =============================================================================
-
-def insert_valid_product(upload_id, vendor_id, product_data):
-    """
-    Insert validated product into RDS products table.
-    
-    Args:
-        upload_id: Upload identifier
-        vendor_id: Vendor identifier
-        product_data: Validated product data
-    
-    Returns:
-        int: Inserted product_id or None
-    """
-    conn = None
-    cursor = None
-    
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        
-        cursor.execute("""
-            INSERT INTO products (
-                vendor_id,
-                vendor_product_id,
-                product_name,
-                category,
-                subcategory,
-                description,
-                sku,
-                brand,
-                price,
-                compare_at_price,
-                stock_quantity,
-                unit,
-                weight_kg,
-                dimensions_cm,
-                image_url,
-                upload_id,
-                status
-            )
-            VALUES (
-                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                %s, %s, %s, %s, %s, %s, %s
-            )
-            RETURNING product_id
-        """, (
-            vendor_id,
-            product_data.get('vendor_product_id'),
-            product_data.get('product_name'),
-            product_data.get('category'),
-            product_data.get('subcategory'),
-            product_data.get('description'),
-            product_data.get('sku'),
-            product_data.get('brand'),
-            product_data.get('price'),
-            product_data.get('compare_at_price'),
-            product_data.get('stock_quantity'),
-            product_data.get('unit', 'piece'),
-            product_data.get('weight_kg'),
-            product_data.get('dimensions_cm'),
-            product_data.get('image_url'),
-            upload_id,
-            'active'
-        ))
-        
-        product_id = cursor.fetchone()[0]
-        conn.commit()
-        
-        print(f"  ✓ Inserted product to RDS: {product_data.get('sku')} (ID: {product_id})")
-        
-        return product_id
-        
-    except Exception as e:
-        print(f"  ✗ Failed to insert product: {str(e)}")
-        if conn:
-            conn.rollback()
-        return None
-    
-    finally:
-        if cursor:
-            cursor.close()
-
-
-def insert_validation_error(upload_id, vendor_id, row_number, vendor_product_id, 
-                           error_type, error_message, product_data):
-    """
-    Insert validation error into RDS validation_errors table.
-    
-    Args:
-        upload_id: Upload identifier
-        vendor_id: Vendor identifier
-        row_number: Row number in CSV
-        vendor_product_id: Vendor's product ID
-        error_type: Error type code
-        error_message: Detailed error message
-        product_data: Original product data
-    
-    Returns:
-        bool: True if successful
-    """
-    conn = None
-    cursor = None
-    
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        
-        cursor.execute("""
-            INSERT INTO validation_errors (
-                upload_id,
-                vendor_id,
-                row_number,
-                vendor_product_id,
-                error_type,
-                error_field,
-                error_message,
-                original_data
-            )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-        """, (
-            upload_id,
-            vendor_id,
-            row_number,
-            vendor_product_id,
-            error_type,
-            None,  # error_field (could extract from error_type)
-            error_message,
-            json.dumps(product_data, default=str)
-        ))
-        
-        conn.commit()
-        
-        return True
-        
-    except Exception as e:
-        print(f"  ⚠ Warning: Failed to insert validation error: {str(e)}")
-        if conn:
-            conn.rollback()
-        return False
-    
-    finally:
-        if cursor:
-            cursor.close()
-
-
-def update_upload_history_counts(upload_id, valid_count=0, error_count=0):
-    """
-    Update upload history with validation counts.
-    
-    Args:
-        upload_id: Upload identifier
-        valid_count: Number of valid products
-        error_count: Number of error products
-    """
-    conn = None
-    cursor = None
-    
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        
-        cursor.execute("""
-            UPDATE upload_history 
-            SET 
-                valid_records = valid_records + %s,
-                error_records = error_records + %s,
-                status = CASE 
-                    WHEN (valid_records + %s + error_records + %s) = total_records 
-                    THEN 
-                        CASE 
-                            WHEN error_records + %s > 0 THEN 'partial'
-                            ELSE 'completed'
-                        END
-                    ELSE 'processing'
-                END,
-                processing_completed_at = CASE 
-                    WHEN (valid_records + %s + error_records + %s) = total_records 
-                    THEN CURRENT_TIMESTAMP
-                    ELSE processing_completed_at
-                END
-            WHERE upload_id = %s
-        """, (
-            valid_count, error_count,
-            valid_count, error_count,
-            error_count,
-            valid_count, error_count,
-            upload_id
-        ))
-        
-        conn.commit()
-        
-    except Exception as e:
-        print(f"  ⚠ Warning: Failed to update upload history: {str(e)}")
-        if conn:
-            conn.rollback()
-    
-    finally:
-        if cursor:
-            cursor.close()
-
-
-# =============================================================================
-# DYNAMODB OPERATIONS
+# DYNAMODB & SQS OPERATIONS
 # =============================================================================
 
-def update_dynamodb_record_status(upload_id, record_id, status, error_reason=None, error_details=None):
+def update_dynamodb_record_status(upload_id, record_id, status,
+                                  error_reason=None, error_details=None):
     """
-    Update DynamoDB record with validation status.
-    
-    Args:
-        upload_id: Upload identifier
-        record_id: Record identifier
-        status: New status ('validated' or 'error')
-        error_reason: Error type (if status is 'error')
-        error_details: Detailed error message (if status is 'error')
-    
-    Returns:
-        bool: True if successful
+    Update validation status of a record in DynamoDB.
     """
     try:
         table = dynamodb.Table(DYNAMODB_TABLE)
-        
-        update_expression = "SET #status = :status, processed_at = :processed_at"
-        expression_values = {
-            ':status': status,
-            ':processed_at': datetime.utcnow().isoformat()
+
+        update_expr = "SET #s = :s, processed_at = :p"
+        expr_vals = {
+            ":s": status,
+            ":p": datetime.utcnow().isoformat()
         }
-        expression_names = {
-            '#status': 'status'
-        }
-        
+        expr_names = {"#s": "status"}
+
         if error_reason:
-            update_expression += ", error_reason = :error_reason, error_details = :error_details"
-            expression_values[':error_reason'] = error_reason
-            expression_values[':error_details'] = error_details
-        
+            update_expr += ", error_reason = :r, error_details = :d"
+            expr_vals.update({
+                ":r": error_reason,
+                ":d": error_details
+            })
+
         table.update_item(
-            Key={
-                'upload_id': upload_id,
-                'record_id': record_id
-            },
-            UpdateExpression=update_expression,
-            ExpressionAttributeValues=expression_values,
-            ExpressionAttributeNames=expression_names
+            Key={"upload_id": upload_id, "record_id": record_id},
+            UpdateExpression=update_expr,
+            ExpressionAttributeValues=expr_vals,
+            ExpressionAttributeNames=expr_names
         )
-        
-        return True
-        
-    except Exception as e:
-        print(f"  ⚠ Warning: Failed to update DynamoDB record: {str(e)}")
-        return False
-
-
-# =============================================================================
-# SQS OPERATIONS
-# =============================================================================
-
-def send_error_to_sqs(upload_id, vendor_id, record_id, row_number, product_data, 
-                     error_type, error_message):
-    """
-    Send error record to SQS for error aggregation.
-    
-    Args:
-        upload_id: Upload identifier
-        vendor_id: Vendor identifier
-        record_id: Record identifier
-        row_number: Row number in CSV
-        product_data: Product data
-        error_type: Error type
-        error_message: Error message
-    
-    Returns:
-        bool: True if successful
-    """
-    if not SQS_ERROR_QUEUE_URL:
-        print("  ⚠ Warning: SQS_ERROR_QUEUE_URL not configured")
-        return False
-    
-    try:
-        message_body = {
-            'upload_id': upload_id,
-            'vendor_id': vendor_id,
-            'record_id': record_id,
-            'row_number': row_number,
-            'error_type': error_type,
-            'error_message': error_message,
-            'product_data': product_data,
-            'timestamp': datetime.utcnow().isoformat()
-        }
-        
-        sqs_client.send_message(
-            QueueUrl=SQS_ERROR_QUEUE_URL,
-            MessageBody=json.dumps(message_body, default=str),
-            MessageAttributes={
-                'upload_id': {
-                    'StringValue': upload_id,
-                    'DataType': 'String'
-                },
-                'vendor_id': {
-                    'StringValue': vendor_id,
-                    'DataType': 'String'
-                },
-                'error_type': {
-                    'StringValue': error_type,
-                    'DataType': 'String'
-                }
+    except Exception:
+        logger.error(
+            "Failed to update DynamoDB record",
+            extra={
+                "upload_id": upload_id,
+                "record_id": record_id,
+                "traceback": traceback.format_exc()
             }
         )
-        
-        return True
-        
-    except Exception as e:
-        print(f"  ⚠ Warning: Failed to send error to SQS: {str(e)}")
-        return False
 
 
-# =============================================================================
-# CLOUDWATCH METRICS
-# =============================================================================
-
-def publish_metrics(upload_id, valid_count, error_count, processing_time):
+def send_error_to_sqs(message):
     """
-    Publish validation metrics to CloudWatch.
-    
-    Args:
-        upload_id: Upload identifier
-        valid_count: Number of valid products
-        error_count: Number of error products
-        processing_time: Processing duration in seconds
+    Send validation error payload to SQS for downstream handling.
     """
     try:
-        cloudwatch.put_metric_data(
-            Namespace='EcommerceProductOnboarding',
-            MetricData=[
-                {
-                    'MetricName': 'ProductsValidated',
-                    'Value': valid_count,
-                    'Unit': 'Count',
-                    'Timestamp': datetime.utcnow(),
-                    'Dimensions': [
-                        {'Name': 'UploadId', 'Value': upload_id}
-                    ]
-                },
-                {
-                    'MetricName': 'ProductsRejected',
-                    'Value': error_count,
-                    'Unit': 'Count',
-                    'Timestamp': datetime.utcnow(),
-                    'Dimensions': [
-                        {'Name': 'UploadId', 'Value': upload_id}
-                    ]
-                },
-                {
-                    'MetricName': 'ValidationProcessingTime',
-                    'Value': processing_time,
-                    'Unit': 'Seconds',
-                    'Timestamp': datetime.utcnow(),
-                    'Dimensions': [
-                        {'Name': 'UploadId', 'Value': upload_id}
-                    ]
-                }
-            ]
+        sqs_client.send_message(
+            QueueUrl=SQS_ERROR_QUEUE_URL,
+            MessageBody=json.dumps(message, default=str)
         )
-        print(f"✓ Metrics published to CloudWatch")
-    except Exception as e:
-        print(f"⚠ Warning: Failed to publish metrics: {str(e)}")
-
+    except Exception:
+        logger.error(
+            "Failed to send error message to SQS",
+            extra={"traceback": traceback.format_exc()}
+        )
 
 # =============================================================================
 # MAIN LAMBDA HANDLER
@@ -813,199 +420,111 @@ def publish_metrics(upload_id, valid_count, error_count, processing_time):
 
 def lambda_handler(event, context):
     """
-    Main Lambda handler function.
-    
-    Triggered by: DynamoDB Streams
-    
-    Args:
-        event: DynamoDB Stream event containing records
-        context: Lambda context
-    
-    Returns:
-        dict: Validation summary
+    Lambda entry point.
+
+    Triggered by DynamoDB Streams INSERT events.
     """
-    
     start_time = datetime.utcnow()
-    
-    print("\n" + "="*80)
-    print("Product Validator Lambda - Started (Container Image)")
-    print("="*80)
-    
-    total_records = 0
-    valid_count = 0
-    error_count = 0
-    
-    upload_ids = set()
-    
+    logger.info(
+        "Product Validator Lambda started",
+        extra={"request_id": context.aws_request_id}
+    )
+
+    total = valid = error = 0
+
     try:
-        # =====================================================================
-        # STEP 1: Process DynamoDB Stream Records
-        # =====================================================================
-        
-        print(f"\n>>> Processing {len(event['Records'])} stream records...")
-        
-        for stream_record in event['Records']:
-            total_records += 1
-            
-            # Only process INSERT events
-            if stream_record['eventName'] != 'INSERT':
-                print(f"  Skipping {stream_record['eventName']} event")
+        for record in event["Records"]:
+            # Process only INSERT events
+            if record["eventName"] != "INSERT":
                 continue
-            
-            # Extract new image from stream record
-            new_image = stream_record['dynamodb']['NewImage']
-            
-            # Parse DynamoDB types to Python types
-            upload_id = new_image['upload_id']['S']
-            record_id = new_image['record_id']['S']
-            vendor_id = new_image['vendor_id']['S']
-            row_number = int(new_image['row_number']['N'])
-            
-            upload_ids.add(upload_id)
-            
-            # Extract product_data (Map type)
-            product_data_raw = new_image['product_data']['M']
-            
-            # Convert DynamoDB Map to Python dict
-            product_data = {}
-            for key, value in product_data_raw.items():
-                if 'S' in value:
-                    product_data[key] = value['S']
-                elif 'N' in value:
-                    # Handle Decimal numbers
-                    product_data[key] = Decimal(value['N'])
-                elif 'NULL' in value:
-                    product_data[key] = None
-            
-            print(f"\n  Record {record_id} (Row {row_number}): {product_data.get('sku', 'N/A')}")
-            
-            # =================================================================
-            # STEP 2: Validate Product
-            # =================================================================
-            
+
+            total += 1
+            image = record["dynamodb"]["NewImage"]
+
+            # Extract primary identifiers
+            upload_id = image["upload_id"]["S"]
+            record_id = image["record_id"]["S"]
+            vendor_id = image["vendor_id"]["S"]
+            row_number = int(image["row_number"]["N"])
+
+            # Convert DynamoDB Map → Python dict
+            product_data = {
+                k: (
+                    v.get("S") if "S" in v else
+                    Decimal(v["N"]) if "N" in v else
+                    None
+                )
+                for k, v in image["product_data"]["M"].items()
+            }
+
+            # Validate product
             is_valid, error_type, error_message = validate_product(product_data, vendor_id)
-            
+
             if is_valid:
-                # =============================================================
-                # STEP 3A: Valid Product - Insert to RDS
-                # =============================================================
-                
-                product_id = insert_valid_product(upload_id, vendor_id, product_data)
-                
-                if product_id:
-                    # Update DynamoDB record status
-                    update_dynamodb_record_status(upload_id, record_id, 'validated')
-                    valid_count += 1
-                    print(f"    ✓ VALID - Inserted to RDS (Product ID: {product_id})")
-                else:
-                    # Insert failed (shouldn't happen after validation)
-                    error_type = 'DATABASE_INSERT_FAILED'
-                    error_message = 'Failed to insert valid product to database'
-                    
-                    # Update DynamoDB record status
-                    update_dynamodb_record_status(
-                        upload_id, record_id, 'error', error_type, error_message
-                    )
-                    
-                    # Send to SQS error queue
-                    send_error_to_sqs(
-                        upload_id, vendor_id, record_id, row_number,
-                        product_data, error_type, error_message
-                    )
-                    
-                    # Insert error to RDS
-                    insert_validation_error(
-                        upload_id, vendor_id, row_number,
-                        product_data.get('vendor_product_id'),
-                        error_type, error_message, product_data
-                    )
-                    
-                    error_count += 1
-                    print(f"    ✗ ERROR - {error_type}: {error_message}")
-            
+                valid += 1
+                update_dynamodb_record_status(upload_id, record_id, "validated")
+                logger.info(
+                    "Product validated",
+                    extra={"upload_id": upload_id, "record_id": record_id}
+                )
             else:
-                # =============================================================
-                # STEP 3B: Invalid Product - Handle Error
-                # =============================================================
-                
-                # Update DynamoDB record status
+                error += 1
                 update_dynamodb_record_status(
-                    upload_id, record_id, 'error', error_type, error_message
+                    upload_id, record_id, "error", error_type, error_message
                 )
-                
-                # Send to SQS error queue
-                send_error_to_sqs(
-                    upload_id, vendor_id, record_id, row_number,
-                    product_data, error_type, error_message
+                send_error_to_sqs({
+                    "upload_id": upload_id,
+                    "vendor_id": vendor_id,
+                    "record_id": record_id,
+                    "row_number": row_number,
+                    "error_type": error_type,
+                    "error_message": error_message,
+                    "product_data": product_data
+                })
+                logger.warning(
+                    "Product validation failed",
+                    extra={
+                        "upload_id": upload_id,
+                        "record_id": record_id,
+                        "error_type": error_type,
+                        "error_message": error_message
+                    }
                 )
-                
-                # Insert error to RDS validation_errors table
-                insert_validation_error(
-                    upload_id, vendor_id, row_number,
-                    product_data.get('vendor_product_id'),
-                    error_type, error_message, product_data
-                )
-                
-                error_count += 1
-                print(f"    ✗ INVALID - {error_type}: {error_message}")
-        
-        # =====================================================================
-        # STEP 4: Update Upload History
-        # =====================================================================
-        
-        print(f"\n>>> Updating upload history...")
-        
-        for upload_id in upload_ids:
-            update_upload_history_counts(upload_id, valid_count, error_count)
-        
-        # =====================================================================
-        # STEP 5: Publish Metrics
-        # =====================================================================
-        
-        print(f"\n>>> Publishing metrics to CloudWatch...")
-        
-        end_time = datetime.utcnow()
-        processing_time = (end_time - start_time).total_seconds()
-        
-        for upload_id in upload_ids:
-            publish_metrics(upload_id, valid_count, error_count, processing_time)
-        
-        # =====================================================================
-        # Summary
-        # =====================================================================
-        
-        print("\n" + "="*80)
-        print("VALIDATION SUMMARY")
-        print("="*80)
-        print(f"Upload IDs: {', '.join(upload_ids)}")
-        print(f"Total Records Processed: {total_records}")
-        print(f"Valid Products: {valid_count}")
-        print(f"Invalid Products: {error_count}")
-        print(f"Success Rate: {(valid_count/total_records*100):.1f}%" if total_records > 0 else "N/A")
-        print(f"Processing Time: {processing_time:.2f} seconds")
-        print("="*80 + "\n")
-        
-        print("✓ Product Validator Lambda - Completed Successfully!")
-        
+
+        duration = (datetime.utcnow() - start_time).total_seconds()
+
+        logger.info(
+            "Validation completed",
+            extra={
+                "total": total,
+                "valid": valid,
+                "errors": error,
+                "duration_sec": duration
+            }
+        )
+
         return {
-            'statusCode': 200,
-            'body': json.dumps({
-                'message': 'Validation completed successfully',
-                'total_records': total_records,
-                'valid_count': valid_count,
-                'error_count': error_count,
-                'processing_time_seconds': processing_time
+            "statusCode": 200,
+            "body": json.dumps({
+                "total_records": total,
+                "valid_records": valid,
+                "error_records": error,
+                "processing_time_seconds": duration
             })
         }
-        
+
     except Exception as e:
-        print(f"\n✗ ERROR: {str(e)}")
-        print("="*80 + "\n")
-        
+        logger.critical(
+            "Validator Lambda failed",
+            extra={
+                "error": str(e),
+                "traceback": traceback.format_exc()
+            }
+        )
         return {
-            'statusCode': 500,
-            'body': json.dumps({
-                'error': str(e),
-                'message': 'Validation failed'
+            "statusCode": 500,
+            "body": json.dumps({
+                "error": str(e),
+                "message": "Validation failed"
             })
         }

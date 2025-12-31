@@ -3,46 +3,39 @@
 Lambda Function: CSV Parser (Container-based)
 ================================================================================
 
-WHAT DOES THIS LAMBDA DO?
-------------------------
-This Lambda processes CSV files uploaded by vendors into S3.
-Each CSV row represents a product.
+PURPOSE
+-------
+Ingest vendor-uploaded CSV files from S3 and persist each row as a
+pending-validation record in DynamoDB.
 
-For every uploaded CSV file, this Lambda:
-1. Identifies which vendor uploaded the file
-2. Verifies the vendor exists and is active (via RDS)
-3. Tracks the upload in an audit table (upload_history)
-4. Parses each CSV row into a structured format
-5. Inserts each row into DynamoDB with status = 'pending_validation'
-6. Publishes CloudWatch metrics for observability
+ARCHITECTURE
+------------
+S3 (CSV Upload)
+    → CSV Parser Lambda (this function)
+        → RDS (vendor validation + upload audit)
+        → DynamoDB (raw product records, status=pending_validation)
+        → CloudWatch Metrics
 
-IMPORTANT DESIGN PRINCIPLE
---------------------------
-This Lambda ONLY ingests data.
-It does NOT validate product correctness.
-
-Why?
-- Separation of concerns
-- Easier scaling
-- Clear ownership of responsibilities
-
-Downstream validation is handled by:
-DynamoDB Streams → Validator Lambda
-
-================================================================================
+DESIGN PRINCIPLES
+-----------------
+- Separation of concerns (ingestion ≠ validation)
+- Schema firewall at CSV boundary
+- Idempotent & auditable ingestion
+- Strong observability (logs + metrics + tracebacks)
 """
 
 # =============================================================================
-# 1️⃣ STANDARD PYTHON LIBRARIES
+# 1️⃣ STANDARD LIBRARIES
 # =============================================================================
-# These are built into Python and require no installation.
 
-import json              # Used for request/response payloads
-import csv               # Parses CSV files
-import os                # Reads environment variables
-import io                # Treats strings as file-like objects
+import json
+import csv
+import os
+import io
+import logging
+import traceback
 from datetime import datetime
-from decimal import Decimal  # Required by DynamoDB (no float support)
+from decimal import Decimal
 
 # =============================================================================
 # 2️⃣ AWS + THIRD-PARTY LIBRARIES
@@ -50,71 +43,62 @@ from decimal import Decimal  # Required by DynamoDB (no float support)
 
 import boto3
 from botocore.exceptions import ClientError
-
 import psycopg2
 from psycopg2.extras import RealDictCursor
-
 from aws_secretsmanager_caching import SecretCache, SecretCacheConfig
 
+# =============================================================================
+# 3️⃣ LOGGING CONFIGURATION
+# =============================================================================
+
+LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO")
+
+logging.basicConfig(
+    level=LOG_LEVEL,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+)
+
+logger = logging.getLogger(__name__)
 
 # =============================================================================
-# 3️⃣ ENVIRONMENT VARIABLES (CONFIGURATION)
+# 4️⃣ ENVIRONMENT VARIABLES
 # =============================================================================
-# Environment variables allow the same code to run in DEV / QA / PROD
-# without changing source code.
 
-DYNAMODB_TABLE = os.environ.get('DYNAMODB_TABLE', 'UploadRecords')
-RDS_SECRET_NAME = os.environ.get('RDS_SECRET_NAME', 'ecommerce/rds/credentials')
-REGION = os.environ.get('AWS_REGION', 'us-east-1')
-
+DYNAMODB_TABLE = os.environ.get("DYNAMODB_TABLE", "UploadRecords")
+RDS_SECRET_NAME = os.environ.get("RDS_SECRET_NAME", "ecommerce/rds/credentials")
+REGION = os.environ.get("AWS_REGION", "us-east-1")
 
 # =============================================================================
-# 4️⃣ AWS CLIENTS (CREATED ONCE PER CONTAINER)
+# 5️⃣ AWS CLIENTS (REUSED ACROSS INVOCATIONS)
 # =============================================================================
-# These objects are created outside lambda_handler so they are reused
-# across warm Lambda invocations (better performance).
 
-s3_client = boto3.client('s3', region_name=REGION)
-dynamodb = boto3.resource('dynamodb', region_name=REGION)
-cloudwatch = boto3.client('cloudwatch', region_name=REGION)
-secretsmanager = boto3.client('secretsmanager', region_name=REGION)
-
+s3_client = boto3.client("s3", region_name=REGION)
+dynamodb = boto3.resource("dynamodb", region_name=REGION)
+cloudwatch = boto3.client("cloudwatch", region_name=REGION)
+secretsmanager = boto3.client("secretsmanager", region_name=REGION)
 
 # =============================================================================
-# 5️⃣ SECRETS MANAGER CACHE
+# 6️⃣ SECRETS MANAGER CACHE
 # =============================================================================
-# Secrets Manager calls are:
-# - slow
-# - expensive
-# - rate-limited
-#
-# This cache ensures:
-# - secret is fetched once per container
-# - reused across Lambda invocations
-# - automatically refreshed if rotated
 
-cache_config = SecretCacheConfig()
-cache = SecretCache(config=cache_config, client=secretsmanager)
-
+# Secrets Manager calls are cached per Lambda container to:
+# - reduce latency
+# - reduce API cost
+# - support secret rotation transparently
+cache = SecretCache(
+    config=SecretCacheConfig(),
+    client=secretsmanager
+)
 
 # =============================================================================
-# 6️⃣ SECRETS MANAGER INTEGRATION
+# 7️⃣ RDS CONNECTION HELPERS
 # =============================================================================
 
 def get_rds_credentials():
     """
-    Retrieve PostgreSQL credentials securely from AWS Secrets Manager.
+    Retrieve PostgreSQL credentials from AWS Secrets Manager.
 
-    STUDENT NOTE:
-    -------------
-    NEVER store database passwords in:
-    - code
-    - environment variables
-    - config files
-
-    Secrets Manager + IAM is the correct approach.
-
-    RETURNS
+    Returns
     -------
     dict
         {
@@ -124,69 +108,73 @@ def get_rds_credentials():
             username,
             password
         }
+
+    Raises
+    ------
+    ClientError
+        If secret retrieval fails
     """
     try:
-        # Either returns cached value OR fetches from Secrets Manager
         secret_string = cache.get_secret_string(RDS_SECRET_NAME)
         secret = json.loads(secret_string)
 
-        # Logging only SAFE metadata (never log passwords)
-        print("✓ RDS credentials retrieved")
-        print(f"  Host: {secret.get('host')}")
-        print(f"  Database: {secret.get('dbname')}")
-
+        # Log safe metadata only (never log secrets)
+        logger.info(
+            "RDS credentials retrieved",
+            extra={"db_host": secret.get("host"), "db_name": secret.get("dbname")}
+        )
         return secret
 
     except ClientError as e:
-        # Explicit error logging helps in production debugging
-        error_code = e.response['Error']['Code']
-        print(f"✗ Secrets Manager error [{error_code}]")
+        logger.error(
+            "Failed to retrieve RDS credentials",
+            extra={
+                "secret_name": RDS_SECRET_NAME,
+                "error": str(e),
+                "traceback": traceback.format_exc()
+            }
+        )
         raise
 
 
 def get_db_connection():
     """
-    Create a PostgreSQL connection using psycopg2.
+    Create a new PostgreSQL connection.
 
-    WHY NO CONNECTION POOL?
-    ----------------------
-    Lambda executions are short-lived.
-    Opening and closing connections is acceptable here.
+    Notes
+    -----
+    - Lambda execution time is short-lived
+    - Connection pooling is intentionally avoided
+    - RDS Proxy can be added later if needed
 
-    For high scale:
-    - Add RDS Proxy
-    - OR Step Functions fan-out control
+    Returns
+    -------
+    psycopg2.connection
+        Active database connection
     """
     creds = get_rds_credentials()
-
     return psycopg2.connect(
-        host=creds.get('host'),
-        port=creds.get('port', 5432),
-        database=creds.get('dbname'),
-        user=creds.get('username'),
-        password=creds.get('password'),
+        host=creds["host"],
+        port=creds.get("port", 5432),
+        database=creds["dbname"],
+        user=creds["username"],
+        password=creds["password"],
         connect_timeout=5
     )
 
-
 # =============================================================================
-# 7️⃣ DATA TYPE CONVERSION HELPERS
+# 8️⃣ DATA TYPE CONVERSION HELPERS
 # =============================================================================
 
 def convert_to_decimal(value):
     """
-    Convert string → Decimal.
+    Convert numeric input to Decimal (required by DynamoDB).
 
-    WHY?
-    ----
-    DynamoDB does NOT support float.
-    Decimal is mandatory.
-
-    Examples:
-    "12.5" → Decimal("12.5")
-    ""     → None
+    Returns
+    -------
+    Decimal | None
     """
-    if value in (None, ''):
+    if value in (None, ""):
         return None
     try:
         return Decimal(str(value))
@@ -196,85 +184,99 @@ def convert_to_decimal(value):
 
 def convert_to_int(value):
     """
-    Convert numeric string → int safely.
+    Convert numeric input to integer safely.
+
+    Returns
+    -------
+    int | None
     """
-    if value in (None, ''):
+    if value in (None, ""):
         return None
     try:
         return int(float(value))
     except Exception:
         return None
 
-
 # =============================================================================
-# 8️⃣ CSV NORMALIZATION LOGIC
+# 9️⃣ CSV NORMALIZATION (SCHEMA FIREWALL)
 # =============================================================================
 
 def parse_csv_row(row, row_number):
     """
-    Convert ONE CSV row into structured product data.
+    Normalize a single CSV row into structured product data.
 
-    STUDENT INSIGHT:
-    ----------------
-    This function acts as a *schema firewall*.
-    Raw CSV never leaks beyond this boundary.
+    This function acts as a **schema firewall**:
+    - Raw CSV data never leaks beyond this boundary
+    - CSV format changes are isolated here
 
-    If CSV format changes → ONLY update this function.
+    Parameters
+    ----------
+    row : dict
+        Raw CSV row from csv.DictReader
+    row_number : int
+        Line number in the CSV file
+
+    Returns
+    -------
+    dict
+        Normalized product payload
     """
     return {
-        'vendor_product_id': row.get('vendor_product_id', ''),
-        'product_name': row.get('product_name', ''),
-        'category': row.get('category', ''),
-        'subcategory': row.get('subcategory', ''),
-        'description': row.get('description', ''),
-        'sku': row.get('sku', ''),
-        'brand': row.get('brand', ''),
-        'price': convert_to_decimal(row.get('price')),
-        'compare_at_price': convert_to_decimal(row.get('compare_at_price')),
-        'stock_quantity': convert_to_int(row.get('stock_quantity')),
-        'unit': row.get('unit', 'piece'),
-        'weight_kg': convert_to_decimal(row.get('weight_kg')),
-        'dimensions_cm': row.get('dimensions_cm', ''),
-        'image_url': row.get('image_url', '')
+        "vendor_product_id": row.get("vendor_product_id", ""),
+        "product_name": row.get("product_name", ""),
+        "category": row.get("category", ""),
+        "subcategory": row.get("subcategory", ""),
+        "description": row.get("description", ""),
+        "sku": row.get("sku", ""),
+        "brand": row.get("brand", ""),
+        "price": convert_to_decimal(row.get("price")),
+        "compare_at_price": convert_to_decimal(row.get("compare_at_price")),
+        "stock_quantity": convert_to_int(row.get("stock_quantity")),
+        "unit": row.get("unit", "piece"),
+        "weight_kg": convert_to_decimal(row.get("weight_kg")),
+        "dimensions_cm": row.get("dimensions_cm", ""),
+        "image_url": row.get("image_url", "")
     }
 
 
 def extract_vendor_id_from_filename(filename):
     """
-    Extract vendor_id from filename.
+    Extract vendor_id from the uploaded filename.
 
-    EXPECTED FORMAT:
+    Expected format:
     ----------------
-    VEND001_YYYYMMDD_HHMMSS.csv
+    VENDOR001_YYYYMMDD_HHMMSS.csv
 
-    Why filename-based identity?
-    ----------------------------
-    - Simple
-    - No need to trust CSV content
-    - Easy traceability
+    Returns
+    -------
+    str | None
     """
     try:
-        return filename.split('_')[0]
+        return filename.split("_")[0]
     except Exception:
         return None
 
-
 # =============================================================================
-# 9️⃣ BUSINESS RULES (RDS CHECKS)
+# 🔟 BUSINESS RULES (RDS LOOKUPS)
 # =============================================================================
 
 def verify_vendor_exists(vendor_id):
     """
-    Business Gate #1
+    Validate vendor existence and active status.
 
-    A vendor:
-    - MUST exist
-    - MUST be active
+    Parameters
+    ----------
+    vendor_id : str
 
-    Otherwise upload is rejected early.
+    Returns
+    -------
+    bool
+        True if vendor exists and is active
     """
     conn = cursor = None
     try:
+        logger.info("Verifying vendor", extra={"vendor_id": vendor_id})
+
         conn = get_db_connection()
         cursor = conn.cursor(cursor_factory=RealDictCursor)
 
@@ -282,19 +284,32 @@ def verify_vendor_exists(vendor_id):
             "SELECT vendor_id, status FROM vendors WHERE vendor_id = %s",
             (vendor_id,)
         )
-
         vendor = cursor.fetchone()
 
         if not vendor:
-            print(f"✗ Vendor {vendor_id} not found")
+            logger.warning("Vendor not found", extra={"vendor_id": vendor_id})
             return False
 
-        if vendor['status'] != 'active':
-            print(f"✗ Vendor {vendor_id} inactive")
+        if vendor["status"] != "active":
+            logger.warning(
+                "Vendor inactive",
+                extra={"vendor_id": vendor_id, "status": vendor["status"]}
+            )
             return False
 
-        print(f"✓ Vendor {vendor_id} verified")
+        logger.info("Vendor verified", extra={"vendor_id": vendor_id})
         return True
+
+    except Exception as e:
+        logger.error(
+            "Vendor verification failed",
+            extra={
+                "vendor_id": vendor_id,
+                "error": str(e),
+                "traceback": traceback.format_exc()
+            }
+        )
+        raise
 
     finally:
         if cursor:
@@ -302,24 +317,26 @@ def verify_vendor_exists(vendor_id):
         if conn:
             conn.close()
 
-
 # =============================================================================
-# 🔟 UPLOAD HISTORY (AUDIT TRAIL IN RDS)
+# 1️⃣1️⃣ UPLOAD HISTORY (AUDIT TRAIL)
 # =============================================================================
 
 def create_upload_history_record(upload_id, vendor_id, file_name, s3_key):
     """
-    Create initial audit record for this upload.
+    Create an audit record for the current upload.
 
-    WHY THIS MATTERS:
-    -----------------
-    - Retry handling
-    - Compliance
-    - Data reconciliation
+    This enables:
+    - Retry tracking
+    - Reconciliation
     - Operational dashboards
     """
     conn = cursor = None
     try:
+        logger.info(
+            "Creating upload history",
+            extra={"upload_id": upload_id, "vendor_id": vendor_id}
+        )
+
         conn = get_db_connection()
         cursor = conn.cursor()
 
@@ -335,13 +352,23 @@ def create_upload_history_record(upload_id, vendor_id, file_name, s3_key):
             vendor_id,
             file_name,
             s3_key,
-            'processing',
+            "processing",
             datetime.utcnow(),
             datetime.utcnow()
         ))
 
         conn.commit()
-        print(f"✓ Upload history created")
+
+    except Exception as e:
+        logger.error(
+            "Failed to create upload history",
+            extra={
+                "upload_id": upload_id,
+                "error": str(e),
+                "traceback": traceback.format_exc()
+            }
+        )
+        raise
 
     finally:
         if cursor:
@@ -352,10 +379,15 @@ def create_upload_history_record(upload_id, vendor_id, file_name, s3_key):
 
 def update_upload_history_counts(upload_id, total_records):
     """
-    Update upload_history once CSV parsing is complete.
+    Update total record count after CSV parsing.
     """
     conn = cursor = None
     try:
+        logger.info(
+            "Updating upload history counts",
+            extra={"upload_id": upload_id, "total_records": total_records}
+        )
+
         conn = get_db_connection()
         cursor = conn.cursor()
 
@@ -366,7 +398,17 @@ def update_upload_history_counts(upload_id, total_records):
         """, (total_records, upload_id))
 
         conn.commit()
-        print("✓ Upload history updated")
+
+    except Exception as e:
+        logger.error(
+            "Failed to update upload history",
+            extra={
+                "upload_id": upload_id,
+                "error": str(e),
+                "traceback": traceback.format_exc()
+            }
+        )
+        raise
 
     finally:
         if cursor:
@@ -374,21 +416,20 @@ def update_upload_history_counts(upload_id, total_records):
         if conn:
             conn.close()
 
-
 # =============================================================================
-# 1️⃣1️⃣ DYNAMODB INGESTION
+# 1️⃣2️⃣ DYNAMODB INGESTION
 # =============================================================================
 
 def batch_insert_dynamodb_records(records):
     """
-    Insert records into DynamoDB efficiently.
+    Insert records into DynamoDB in batches of 25.
 
-    DynamoDB LIMIT:
-    ---------------
-    Max 25 items per batch write.
+    DynamoDB batch_writer handles retries automatically.
     """
     table = dynamodb.Table(DYNAMODB_TABLE)
     successful = failed = 0
+
+    logger.info("Starting DynamoDB batch insert", extra={"total": len(records)})
 
     for i in range(0, len(records), 25):
         with table.batch_writer() as writer:
@@ -396,111 +437,142 @@ def batch_insert_dynamodb_records(records):
                 try:
                     writer.put_item(Item=record)
                     successful += 1
-                except Exception:
+                except Exception as e:
                     failed += 1
+                    logger.error(
+                        "DynamoDB insert failed",
+                        extra={
+                            "upload_id": record.get("upload_id"),
+                            "record_id": record.get("record_id"),
+                            "error": str(e),
+                            "traceback": traceback.format_exc()
+                        }
+                    )
 
     return successful, failed
 
-
 # =============================================================================
-# 1️⃣2️⃣ CLOUDWATCH METRICS
+# 1️⃣3️⃣ CLOUDWATCH METRICS
 # =============================================================================
 
 def publish_metrics(upload_id, total, success, failed, duration):
     """
-    Publish metrics for monitoring & alerting.
+    Publish ingestion metrics to CloudWatch.
     """
     cloudwatch.put_metric_data(
-        Namespace='EcommerceProductOnboarding',
+        Namespace="EcommerceProductOnboarding",
         MetricData=[
-            {'MetricName': 'CSVRecordsProcessed', 'Value': total},
-            {'MetricName': 'CSVRecordsSuccessful', 'Value': success},
-            {'MetricName': 'CSVProcessingTime', 'Value': duration}
+            {"MetricName": "CSVRecordsProcessed", "Value": total},
+            {"MetricName": "CSVRecordsSuccessful", "Value": success},
+            {"MetricName": "CSVProcessingTime", "Value": duration}
         ]
     )
 
-
 # =============================================================================
-# 1️⃣3️⃣ MAIN LAMBDA HANDLER
+# 1️⃣4️⃣ LAMBDA HANDLER
 # =============================================================================
 
 def lambda_handler(event, context):
     """
-    Orchestrates the entire CSV ingestion pipeline.
-    """
+    Lambda entry point.
 
+    Triggered by:
+    - S3 ObjectCreated events for CSV uploads
+    """
     start_time = datetime.utcnow()
 
-    try:
-        # Step 1: Read S3 event
-        s3_info = event['Records'][0]['s3']
-        bucket = s3_info['bucket']['name']
-        key = s3_info['object']['key']
-        filename = key.split('/')[-1]
+    logger.info(
+        "CSV ingestion started",
+        extra={"request_id": context.aws_request_id}
+    )
 
-        # Step 2: Generate upload_id
-        timestamp = filename.replace('.csv', '').split('_', 1)[1]
+    try:
+        # Extract S3 event details
+        s3_info = event["Records"][0]["s3"]
+        bucket = s3_info["bucket"]["name"]
+        key = s3_info["object"]["key"]
+        filename = key.split("/")[-1]
+
+        # Generate upload identifier
+        timestamp = filename.replace(".csv", "").split("_", 1)[1]
         upload_id = f"UPLOAD_{timestamp}"
 
-        # Step 3: Vendor validation
+        # Resolve vendor
         vendor_id = extract_vendor_id_from_filename(filename)
         if not verify_vendor_exists(vendor_id):
             raise ValueError("Vendor validation failed")
 
-        # Step 4: Audit record
+        # Create audit record
         create_upload_history_record(upload_id, vendor_id, filename, key)
 
-        # Step 5: Download CSV
+        # Download CSV content
         csv_content = s3_client.get_object(
             Bucket=bucket,
             Key=key
-        )['Body'].read().decode('utf-8')
+        )["Body"].read().decode("utf-8")
 
-        # Step 6: Parse CSV
+        # Parse CSV rows
         reader = csv.DictReader(io.StringIO(csv_content))
         records = []
 
         for i, row in enumerate(reader, 1):
             records.append({
-                'upload_id': upload_id,
-                'record_id': f"REC_{i:05d}",
-                'vendor_id': vendor_id,
-                'row_number': i,
-                'product_data': parse_csv_row(row, i),
-                'status': 'pending_validation',
-                'error_reason': None,
-                'error_details': None,
-                'processed_at': None,
-                'created_at': datetime.utcnow().isoformat()
+                "upload_id": upload_id,
+                "record_id": f"REC_{i:05d}",
+                "vendor_id": vendor_id,
+                "row_number": i,
+                "product_data": parse_csv_row(row, i),
+                "status": "pending_validation",
+                "error_reason": None,
+                "error_details": None,
+                "processed_at": None,
+                "created_at": datetime.utcnow().isoformat()
             })
 
-        # Step 7: DynamoDB insert
+        # Persist to DynamoDB
         success, failed = batch_insert_dynamodb_records(records)
 
-        # Step 8: Update audit record
+        # Update audit counts
         update_upload_history_counts(upload_id, len(records))
 
-        # Step 9: Metrics
+        # Publish metrics
         duration = (datetime.utcnow() - start_time).total_seconds()
         publish_metrics(upload_id, len(records), success, failed, duration)
 
+        logger.info(
+            "CSV ingestion completed",
+            extra={
+                "upload_id": upload_id,
+                "success": success,
+                "failed": failed,
+                "duration_sec": duration
+            }
+        )
+
         return {
-            'statusCode': 200,
-            'body': json.dumps({
-                'upload_id': upload_id,
-                'vendor_id': vendor_id,
-                'total_records': len(records),
-                'successful_records': success,
-                'failed_records': failed,
-                'processing_time_seconds': duration
+            "statusCode": 200,
+            "body": json.dumps({
+                "upload_id": upload_id,
+                "vendor_id": vendor_id,
+                "total_records": len(records),
+                "successful_records": success,
+                "failed_records": failed,
+                "processing_time_seconds": duration
             })
         }
 
     except Exception as e:
+        logger.critical(
+            "CSV ingestion failed",
+            extra={
+                "error": str(e),
+                "traceback": traceback.format_exc()
+            }
+        )
         return {
-            'statusCode': 500,
-            'body': json.dumps({
-                'error': str(e),
-                'message': 'CSV parsing failed'
+            "statusCode": 500,
+            "body": json.dumps({
+                "error": str(e),
+                "message": "CSV parsing failed"
             })
         }
