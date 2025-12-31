@@ -24,7 +24,7 @@ import json
 import os
 import boto3
 from typing import Dict, Any
-from datetime import datetime
+from datetime import datetime, UTC
 
 # ---------------------------------------------------------
 # AWS Clients
@@ -117,7 +117,7 @@ def create_customer(event_body: Dict[str, Any]) -> Dict[str, Any]:
         "customer_name": "John Doe",
         "email": "john@example.com",
         "city": "New York",
-        "state": "NY"
+        "state": "NY"create_customer
     }
 
     Returns
@@ -157,7 +157,7 @@ def create_customer(event_body: Dict[str, Any]) -> Dict[str, Any]:
         event_body["email"],
         event_body.get("city"),
         event_body.get("state"),
-        datetime.utcnow()  # Server-side timestamp
+        datetime.now(UTC).isoformat()
     ]
 
     result = invoke_query_executor(query, params, fetch=True)
@@ -421,7 +421,7 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
 
         # Route requests
         if http_method == "POST":
-            response = create_customer(body)
+            response = (body)
         elif http_method == "GET":
             response = get_customers(query_parameters)
         elif http_method == "PUT":
