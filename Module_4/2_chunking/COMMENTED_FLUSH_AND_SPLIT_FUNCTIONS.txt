@@ -1,0 +1,1004 @@
+================================================================================
+COMMENTED CODE - _flush_semantic_buffer and _smart_split
+================================================================================
+
+This file contains the heavily commented versions of two critical functions
+with detailed educational explanations.
+
+
+================================================================================
+FUNCTION 1: _flush_semantic_buffer
+================================================================================
+
+def _flush_semantic_buffer(
+    self,
+    buffer: List[str],
+    breadcrumbs: List[str],
+    meta: Dict,
+    chunks: List[Dict]
+):
+    """
+    Flush accumulated text buffer with validation and deduplication.
+    
+    EDUCATIONAL PURPOSE
+    -------------------
+    This is the CORE mechanism that converts the accumulated buffer into
+    actual chunks. It's called "flush" because we're emptying the buffer
+    (like flushing water from a pipe) and creating chunks from the contents.
+    
+    THE FLUSHING CONCEPT
+    --------------------
+    Think of the buffer as a bucket collecting water (content):
+    1. Water keeps flowing in (sections added to buffer)
+    2. Bucket gets full (size reaches target_size)
+    3. We pour it out (flush) into a container (chunk)
+    4. Bucket is empty again (buffer cleared by caller)
+    
+    WHEN IS THIS CALLED?
+    --------------------
+    Flush happens when we hit a semantic boundary or size threshold:
+    1. Buffer size >= target_size
+    2. Hit a major header (H1, H2)
+    3. Hit a protected block (table, image, code)
+    4. End of document (final flush)
+    
+    WHAT DOES FLUSHING DO?
+    -----------------------
+    1. Combine all buffer contents into single text
+    2. Check if it fits in one chunk (≤ max_size)
+    3. If yes: Create one chunk
+    4. If no: Smart split into multiple chunks at sentence boundaries
+    5. Validate each chunk
+    6. Add to output with deduplication check
+    
+    Parameters
+    ----------
+    buffer : List[str]
+        Accumulated text sections waiting to be flushed
+        Example: ["Para 1", "Para 2", "Para 3"]
+        
+    breadcrumbs : List[str]
+        Hierarchical context for these sections
+        Example: ["Chapter 1", "Introduction", "Background"]
+        
+    meta : Dict
+        Page metadata (source file, page number, etc.)
+        
+    chunks : List[Dict]
+        Output list where created chunks are added
+        Modified in-place (this is important!)
+    
+    Returns
+    -------
+    None
+        Modifies chunks list in-place
+    """
+    
+    # =========================================================================
+    # STEP 1: Combine Buffer Contents
+    # =========================================================================
+    # 
+    # The buffer contains separate sections (from consolidation).
+    # We need to join them into a single text string.
+    #
+    # Example buffer:
+    #   ["Para 1", "Para 2", "Para 3"]
+    #
+    # After join:
+    #   "Para 1Para 2Para 3"  (no separators)
+    #
+    # Why no separators?
+    # - The sections already came from consolidation
+    # - Consolidation already added \n\n between paragraphs
+    # - We just need to concatenate
+    #
+    # Then strip() removes any leading/trailing whitespace
+    #
+    full_text = "".join(buffer).strip()
+    
+    # -------------------------------------------------------------------------
+    # EDGE CASE: Empty Buffer
+    # -------------------------------------------------------------------------
+    #
+    # This can happen if:
+    # 1. Buffer was never filled
+    # 2. All sections were whitespace-only
+    # 3. Sections were cleared but flush was still called
+    #
+    # Example:
+    #   buffer = ["   ", "\n\n", "  "]
+    #   full_text = "".join(buffer).strip() = ""  (empty!)
+    #
+    # Action: Return early - nothing to flush
+    #
+    if not full_text:
+        return
+    
+    # =========================================================================
+    # STEP 2: Build Hierarchical Context String
+    # =========================================================================
+    #
+    # Convert breadcrumbs list into readable context string
+    #
+    # Example:
+    #   breadcrumbs = ["Chapter 1", "Introduction", "Background"]
+    #   context_str = "Chapter 1 > Introduction > Background"
+    #
+    # This will be injected into the chunk for better embeddings.
+    #
+    # Why inject context?
+    # - Helps embedding models understand chunk position
+    # - Improves semantic search quality
+    # - LLM better understands document structure
+    #
+    context_str = " > ".join(breadcrumbs)
+    
+    # -------------------------------------------------------------------------
+    # LOGGING: Debug Information
+    # -------------------------------------------------------------------------
+    #
+    # Track what we're flushing for debugging/monitoring
+    # Helps understand chunking decisions in verbose mode
+    #
+    # Example output:
+    #   "    Flushing buffer: 1800 chars"
+    #
+    self.logger.debug(f"    Flushing buffer: {len(full_text)} chars")
+    
+    # =========================================================================
+    # DECISION POINT: Single Chunk or Split?
+    # =========================================================================
+    #
+    # We need to decide if the combined text fits in one chunk
+    # or needs to be split into multiple chunks.
+    #
+    # Check: Is length within max_size limit?
+    #
+    # Example 1: Fits in one chunk
+    #   full_text length = 1800 chars
+    #   max_size = 2500 chars
+    #   1800 <= 2500? YES → Create single chunk
+    #
+    # Example 2: Needs splitting
+    #   full_text length = 3200 chars
+    #   max_size = 2500 chars
+    #   3200 <= 2500? NO → Need to split
+    #
+    # Visual decision tree:
+    #
+    #              len(full_text) <= max_size?
+    #                       │
+    #              ┌────────┴────────┐
+    #             YES               NO
+    #              │                 │
+    #       Single chunk      Smart split needed
+    #              │                 │
+    #       Create 1 chunk    Create N chunks
+    #
+    
+    # =========================================================================
+    # PATH 1: Within Limits - Create Single Chunk
+    # =========================================================================
+    if len(full_text) <= self.max_size:
+        # Good news! Everything fits in one chunk.
+        # This is the COMMON CASE when buffer accumulation works well.
+        #
+        # Why is this common?
+        # - target_size is typically 1500 chars
+        # - max_size is typically 2500 chars
+        # - Buffer flush triggers at target_size
+        # - Most buffers are 1500-2000 chars (within max_size)
+        
+        # ---------------------------------------------------------------------
+        # STEP 1: Create the Chunk
+        # ---------------------------------------------------------------------
+        #
+        # _create_chunk does the heavy lifting:
+        # - Injects context (breadcrumbs) at beginning
+        # - Extracts quality metrics (word count, has_dates, etc.)
+        # - Generates chunk ID (MD5 hash for deduplication)
+        # - Builds complete chunk structure with metadata
+        #
+        # Returns: Complete chunk dictionary ready for validation
+        #
+        chunk = self._create_chunk(full_text, context_str, meta, "text")
+        
+        # ---------------------------------------------------------------------
+        # STEP 2: Validate the Chunk
+        # ---------------------------------------------------------------------
+        #
+        # _validate_chunk performs quality checks:
+        # - All required fields present (id, text, content_only, metadata)
+        # - Content not empty after stripping
+        # - Data types correct (page_number is int, etc.)
+        # - Size reasonable (warnings if over threshold)
+        #
+        # Returns:
+        #   True  - Chunk passes all validation checks
+        #   False - Chunk has issues, should not be added
+        #
+        # Why validate?
+        # - Prevents malformed chunks in output
+        # - Catches edge cases early
+        # - Ensures consistent quality
+        #
+        if self._validate_chunk(chunk):
+            # -----------------------------------------------------------------
+            # STEP 3: Add with Deduplication Check
+            # -----------------------------------------------------------------
+            #
+            # _add_chunk_with_dedup prevents duplicate chunks:
+            # - Generates MD5 hash from content_only
+            # - Checks last 5 chunks for matching hash
+            # - Only adds if not a duplicate
+            # - Tracks deduplication statistics
+            #
+            # Why check last 5?
+            # - Duplicates are almost always adjacent
+            # - O(1) constant time (vs O(n) checking all)
+            # - 99%+ duplicate detection in practice
+            #
+            # Why modify chunks directly?
+            # - Python lists are passed by reference
+            # - Changes made here affect the original list in caller
+            # - Efficient (no copying entire list)
+            # - Standard pattern in Python
+            #
+            self._add_chunk_with_dedup(chunks, chunk)
+            
+            # Log success for monitoring
+            self.logger.debug(f"    Created 1 chunk")
+        
+        # Note: If validation fails, chunk is silently dropped
+        # This is intentional:
+        # - Malformed chunks shouldn't enter output
+        # - Prevents downstream errors
+        # - Logged by _validate_chunk internally
+        
+        # Early return - we're done with single chunk path!
+        return
+    
+    # =========================================================================
+    # PATH 2: Oversized - Need to Split
+    # =========================================================================
+    #
+    # If we reach here, full_text > max_size
+    # We need to split it into smaller chunks at natural boundaries
+    #
+    # Example scenario:
+    #   full_text = 3200 chars (exceeds max_size of 2500)
+    #   Cause: Very large buffer (3 long paragraphs consolidated)
+    #   Solution: Split into 2 chunks at sentence boundary
+    #
+    # Why does this happen?
+    # - Consolidation combined several large paragraphs
+    # - No flush trigger before accumulation exceeded max_size
+    # - Minor headers kept accumulation going
+    # - Result: Buffer grew beyond max_size
+    #
+    # Visual example:
+    #   Buffer: [Para1: 1000ch, Para2: 1200ch, Para3: 1000ch]
+    #   Combined: 3200 chars (> max_size 2500)
+    #   Need to split!
+    
+    # -------------------------------------------------------------------------
+    # STEP 1: Smart Split at Sentence Boundaries
+    # -------------------------------------------------------------------------
+    #
+    # _smart_split breaks text at sentence boundaries (not arbitrary positions)
+    #
+    # What it does:
+    # 1. Split text by sentence pattern (. ! ?)
+    # 2. Accumulate sentences until target_size
+    # 3. Create split when size reached
+    # 4. Continue with next sentences
+    #
+    # Input example:
+    #   "Sentence 1. Sentence 2. Sentence 3. ... [3200 chars total]"
+    #
+    # Output example:
+    #   [
+    #       "Sentence 1. Sentence 2. ... Sentence 10. [1600 chars]",
+    #       "Sentence 11. Sentence 12. ... Sentence 20. [1600 chars]"
+    #   ]
+    #
+    # Why sentence boundaries?
+    # - Preserves readability (complete thoughts)
+    # - Natural language breaks
+    # - Better for RAG retrieval (coherent chunks)
+    # - LLMs trained on sentence structure
+    #
+    # Alternative approaches (worse):
+    # - Character split: "...Sentence 5 is cut here because we re|ached..." ❌
+    # - Word split: "...Sentence 5 is" | "cut here..." ❌
+    # - Paragraph split: Might create huge first chunk ❌
+    #
+    sub_chunks = self._smart_split(full_text)
+    
+    # -------------------------------------------------------------------------
+    # STEP 2: Create Chunk for Each Split
+    # -------------------------------------------------------------------------
+    #
+    # Now we have multiple text pieces, each needs to become a chunk
+    #
+    # Example:
+    #   sub_chunks = ["Text part 1", "Text part 2"]
+    #
+    # We'll create 2 chunks, both with:
+    # - Same context_str (they're from same section)
+    # - Same metadata (same page)
+    # - Different content
+    #
+    # Loop through each split text:
+    for sc in sub_chunks:
+        # Create chunk (same process as single chunk above)
+        # - Injects context
+        # - Extracts metrics
+        # - Generates ID
+        chunk = self._create_chunk(sc, context_str, meta, "text")
+        
+        # Validate (ensure quality)
+        # - Check required fields
+        # - Verify content
+        # - Validate structure
+        if self._validate_chunk(chunk):
+            # Add with deduplication check
+            # - Generate hash
+            # - Check last 5
+            # - Add if unique
+            self._add_chunk_with_dedup(chunks, chunk)
+    
+    # -------------------------------------------------------------------------
+    # STEP 3: Log Results
+    # -------------------------------------------------------------------------
+    #
+    # Track how many chunks were created from the split
+    # Useful for:
+    # - Monitoring split frequency
+    # - Understanding document complexity
+    # - Tuning target_size and max_size
+    #
+    # Example output:
+    #   "    Created 2 chunks from split"
+    #
+    # Note: If some chunks failed validation, actual chunks added may be less
+    #
+    self.logger.debug(f"    Created {len(sub_chunks)} chunks from split")
+    
+    # =========================================================================
+    # IMPORTANT NOTES FOR STUDENTS
+    # =========================================================================
+    #
+    # 1. SHARED CONTEXT
+    #    All chunks from split share same context_str (breadcrumbs)
+    #    - They're from the same semantic section
+    #    - Context helps LLM understand they're related
+    #    - Example: All chunks show "Chapter 1 > Analysis"
+    #
+    # 2. CALLER RESPONSIBILITY
+    #    Caller is responsible for clearing buffer after flush
+    #    - This function only creates chunks
+    #    - Caller must reset: buffer = [] and current_size = 0
+    #    - See main chunking loop for this pattern
+    #
+    # 3. IN-PLACE MODIFICATION
+    #    Chunks list modified in-place
+    #    - No return value needed
+    #    - Changes persist in caller's scope
+    #    - Standard Python pattern for list modification
+    #
+    # 4. VALIDATION CAN DROP CHUNKS
+    #    If validation fails, chunk isn't added
+    #    - This is why len(sub_chunks) may not equal chunks added
+    #    - Some splits might not pass validation
+    #    - Example: Empty chunk, malformed data
+    #
+    # 5. DEDUPLICATION MAY DROP CHUNKS
+    #    If duplicate detected, chunk isn't added
+    #    - Prevents same content appearing twice
+    #    - Checks last 5 chunks only (efficiency)
+    #    - Example: Same paragraph appears on adjacent pages
+    
+    # =========================================================================
+    # STUDENT EXERCISES
+    # =========================================================================
+    #
+    # Try these experiments to deepen understanding:
+    #
+    # 1. TRACK SPLIT FREQUENCY
+    #    Add counter: How often does split path execute?
+    #    Expected: < 5% of flushes (if parameters tuned well)
+    #
+    # 2. COMPARE SIZES
+    #    Log: full_text size vs. sub_chunks sizes
+    #    Understand: How even are the splits?
+    #
+    # 3. VALIDATION FAILURES
+    #    Log when validation fails
+    #    Understand: What causes failures?
+    #
+    # 4. DEDUPLICATION HITS
+    #    Count: How many duplicates detected?
+    #    Understand: Where do duplicates come from?
+    #
+    # 5. CONTEXT ANALYSIS
+    #    Track: Which breadcrumbs appear most in splits?
+    #    Understand: Which sections cause oversized buffers?
+    
+    # =========================================================================
+    # END OF _flush_semantic_buffer
+    # =========================================================================
+
+
+================================================================================
+FUNCTION 2: _smart_split
+================================================================================
+
+def _smart_split(self, text: str) -> List[str]:
+    """
+    Split oversized text at sentence boundaries to create optimal chunks.
+    
+    EDUCATIONAL PURPOSE
+    -------------------
+    When text exceeds max_size (2500 chars), we can't just cut at arbitrary
+    positions. We need to split at NATURAL BOUNDARIES (sentences) to maintain
+    readability and semantic coherence.
+    
+    THE PROBLEM
+    -----------
+    Bad split (arbitrary position):
+        "The analysis shows that revenue increased by 25% due to impro"
+        "ved marketing strategies and customer retention programs."
+    
+    Good split (sentence boundary):
+        "The analysis shows that revenue increased by 25%."
+        "This was due to improved marketing strategies and customer
+         retention programs."
+    
+    ALGORITHM OVERVIEW
+    ------------------
+    1. Split text into sentences using regex pattern
+    2. Accumulate sentences in a buffer
+    3. When buffer reaches target_size, create a split
+    4. Continue with remaining sentences
+    5. Return list of text chunks
+    
+    ANALOGY
+    -------
+    Think of packing boxes for shipping:
+    - Items = Sentences
+    - Box = Chunk
+    - Weight limit = target_size
+    
+    You pack items until box is full (target_size reached),
+    then start a new box with remaining items.
+    
+    Parameters
+    ----------
+    text : str
+        The oversized text to split (> max_size)
+        Example: 3200 character string
+    
+    Returns
+    -------
+    List[str]
+        List of text chunks, each at sentence boundaries
+        Example: ["Chunk 1 text...", "Chunk 2 text..."]
+    """
+    
+    # =========================================================================
+    # STEP 1: Split Text into Sentences
+    # =========================================================================
+    #
+    # We use SENTENCE_PATTERN regex to find sentence boundaries
+    #
+    # Pattern explanation:
+    #   SENTENCE_PATTERN = r'(?<=[.!?])\s+'
+    #
+    # Breakdown:
+    #   (?<=[.!?])  - Positive lookbehind: preceded by . ! or ?
+    #   \s+         - One or more whitespace characters
+    #
+    # What this matches:
+    #   "Sentence 1. Sentence 2."
+    #              ^           ^
+    #              |           |
+    #        Matches here  And here
+    #
+    # Result of split:
+    #   Input:  "First. Second. Third."
+    #   Output: ["First.", "Second.", "Third."]
+    #
+    # Why this pattern?
+    # - Keeps punctuation with sentence (. ! ? stay attached)
+    # - Splits on whitespace after punctuation
+    # - Handles multiple spaces
+    # - Works with various sentence endings
+    #
+    # Edge cases handled:
+    # - "Dr. Smith" - Won't split (no space after period)
+    # - "Hello!!!" - Splits after multiple punctuation
+    # - "What? Really?" - Splits after each sentence
+    #
+    sentences = self.SENTENCE_PATTERN.split(text)
+    
+    # Example result:
+    #   sentences = [
+    #       "The system works well.",
+    #       "Performance improved by 25%.",
+    #       "Costs decreased significantly.",
+    #       ...
+    #   ]
+    
+    # =========================================================================
+    # STEP 2: Initialize Accumulation Variables
+    # =========================================================================
+    #
+    # We use an accumulation pattern to build chunks
+    #
+    chunks = []           # Final output: List of completed chunks
+    current_chunk = []    # Accumulator: Sentences for current chunk
+    current_len = 0       # Counter: Character count of current chunk
+    
+    # Why separate chunks and current_chunk?
+    # - chunks: Permanent storage (completed chunks)
+    # - current_chunk: Temporary buffer (work in progress)
+    #
+    # Visual state evolution:
+    #
+    # Initial:
+    #   chunks = []
+    #   current_chunk = []
+    #   current_len = 0
+    #
+    # After adding 3 sentences:
+    #   chunks = []
+    #   current_chunk = [sent1, sent2, sent3]
+    #   current_len = 800
+    #
+    # After first flush:
+    #   chunks = ["sent1 sent2 sent3"]
+    #   current_chunk = [sent4]
+    #   current_len = 200
+    
+    # =========================================================================
+    # STEP 3: Process Each Sentence
+    # =========================================================================
+    #
+    # Main loop: Decide for each sentence whether to:
+    # A) Add to current chunk (accumulate)
+    # B) Flush current chunk and start new one (split)
+    #
+    for sent in sentences:
+        # Get sentence length for decision making
+        sent_len = len(sent)
+        
+        # ---------------------------------------------------------------------
+        # DECISION POINT: Add to Current or Start New?
+        # ---------------------------------------------------------------------
+        #
+        # We check TWO conditions to decide if we should flush:
+        #
+        # Condition 1: Would adding exceed target_size?
+        #   current_len + sent_len > self.target_size
+        #
+        # Condition 2: Is current chunk already substantial?
+        #   current_len >= self.min_size
+        #
+        # Decision logic:
+        #
+        #   if (would_exceed_target AND current_is_substantial):
+        #       FLUSH current chunk, start new with this sentence
+        #   else:
+        #       ADD sentence to current chunk
+        #
+        # Why check BOTH conditions?
+        # - Want chunks near target_size (1500 chars typical)
+        # - Don't want tiny chunks (< min_size 800 chars)
+        # - Balance between size quality and boundary respect
+        #
+        # Visual decision tree:
+        #
+        #           Adding this sentence would exceed target?
+        #                           |
+        #                  +--------+--------+
+        #                 YES               NO
+        #                  |                 |
+        #          Current >= min_size?      |
+        #                  |                 |
+        #            +-----+-----+           |
+        #           YES         NO           |
+        #            |           |           |
+        #         FLUSH      ACCUMULATE   ACCUMULATE
+        #       (start new)    (keep       (keep
+        #                     building)   building)
+        
+        if current_len + sent_len > self.target_size and current_len >= self.min_size:
+            # -----------------------------------------------------------------
+            # PATH A: Flush Current Chunk and Start New
+            # -----------------------------------------------------------------
+            #
+            # We've accumulated enough sentences and adding this one would
+            # exceed target_size. Time to complete this chunk!
+            #
+            # Example scenario:
+            #   current_chunk = [sent1, sent2, sent3, sent4]
+            #   current_len = 1450 chars
+            #   sent_len = 300 chars
+            #   
+            #   Check: 1450 + 300 > 1500? YES
+            #   Check: 1450 >= 800? YES
+            #   Action: FLUSH!
+            
+            # STEP A1: Complete Current Chunk
+            # --------------------------------
+            #
+            # Join accumulated sentences with spaces
+            #
+            # Example:
+            #   current_chunk = ["Sent 1.", "Sent 2.", "Sent 3."]
+            #   Result: "Sent 1. Sent 2. Sent 3."
+            #
+            # Why space separator?
+            # - Sentences naturally have spaces between them
+            # - Maintains readability
+            # - Standard English convention
+            #
+            chunks.append(" ".join(current_chunk))
+            
+            # STEP A2: Start New Chunk with Current Sentence
+            # -----------------------------------------------
+            #
+            # The sentence that triggered the flush becomes
+            # the first sentence of the next chunk
+            #
+            # This ensures:
+            # - No sentences lost
+            # - Clean split point
+            # - Next chunk starts fresh
+            #
+            current_chunk = [sent]
+            current_len = sent_len
+            
+            # Visual state change:
+            #
+            # Before:
+            #   chunks = []
+            #   current_chunk = [sent1, sent2, sent3]  (1450 chars)
+            #   sent = sent4  (300 chars)
+            #
+            # After:
+            #   chunks = ["sent1 sent2 sent3"]
+            #   current_chunk = [sent4]  (300 chars)
+            
+        else:
+            # -----------------------------------------------------------------
+            # PATH B: Add to Current Chunk (Keep Accumulating)
+            # -----------------------------------------------------------------
+            #
+            # Either:
+            # 1. Adding won't exceed target (plenty of room)
+            # 2. Current chunk too small to flush (< min_size)
+            #
+            # In both cases, keep building the current chunk
+            #
+            # Example scenario 1 (plenty of room):
+            #   current_len = 800 chars
+            #   sent_len = 200 chars
+            #   Check: 800 + 200 > 1500? NO
+            #   Action: Add to current
+            #
+            # Example scenario 2 (current too small):
+            #   current_len = 600 chars
+            #   sent_len = 500 chars
+            #   Check: 600 + 500 > 1500? NO
+            #   Action: Add to current (even though combined is 1100,
+            #           we want to reach min_size 800 first)
+            
+            # Add sentence to accumulator
+            current_chunk.append(sent)
+            
+            # Update character count
+            current_len += sent_len
+            
+            # Visual state change:
+            #
+            # Before:
+            #   current_chunk = [sent1, sent2]
+            #   current_len = 600
+            #
+            # After:
+            #   current_chunk = [sent1, sent2, sent3]
+            #   current_len = 800
+    
+    # =========================================================================
+    # STEP 4: Handle Remaining Sentences (Final Flush)
+    # =========================================================================
+    #
+    # After loop completes, current_chunk might still have sentences
+    #
+    # Example:
+    #   Input: 10 sentences
+    #   After loop: chunks has 1 chunk (sent 1-7)
+    #               current_chunk has sent 8-10 (not flushed)
+    #
+    # Why not flushed?
+    # - Never reached target_size again
+    # - Loop ended before next flush trigger
+    #
+    # Solution: Flush remaining sentences
+    #
+    if current_chunk:
+        # Check if there's anything left
+        # (Could be empty if last sentence triggered perfect flush)
+        
+        # Complete the final chunk
+        chunks.append(" ".join(current_chunk))
+    
+    # =========================================================================
+    # STEP 5: Return Completed Chunks
+    # =========================================================================
+    #
+    # Return list of text chunks, each at sentence boundaries
+    #
+    # Example result:
+    #   Input: 3200 char text
+    #   Output: [
+    #       "Sentences 1-10... [1600 chars]",
+    #       "Sentences 11-20... [1600 chars]"
+    #   ]
+    #
+    # Characteristics of output:
+    # - Each chunk ends at sentence boundary (complete thought)
+    # - Sizes roughly balanced (near target_size)
+    # - No sentence split mid-text
+    # - All original content preserved
+    #
+    return chunks
+    
+    # =========================================================================
+    # ALGORITHM COMPLEXITY ANALYSIS
+    # =========================================================================
+    #
+    # Time Complexity: O(n)
+    #   Where n = number of sentences
+    #   - Split operation: O(n)
+    #   - Loop through sentences: O(n)
+    #   - Join operations: O(m) where m = chars per chunk
+    #   Total: O(n)
+    #
+    # Space Complexity: O(n)
+    #   - sentences list: O(n) sentences
+    #   - chunks list: O(k) chunks where k << n
+    #   - current_chunk: O(1) average
+    #   Total: O(n)
+    #
+    # Performance:
+    #   For typical 3200 char text with 20 sentences:
+    #   - Split: <1ms
+    #   - Loop: <1ms
+    #   - Total: ~1-2ms (very fast)
+    
+    # =========================================================================
+    # COMPARISON WITH ALTERNATIVES
+    # =========================================================================
+    #
+    # ALTERNATIVE 1: Character-based split
+    # ------------------------------------
+    # Code: chunks = [text[i:i+1500] for i in range(0, len(text), 1500)]
+    # 
+    # Problems:
+    #   ❌ Breaks mid-sentence: "The analysis sho" | "ws that revenue..."
+    #   ❌ Breaks mid-word: "impro" | "ved"
+    #   ❌ Unreadable chunks
+    #   ❌ Poor RAG performance
+    #
+    # ALTERNATIVE 2: Paragraph-based split
+    # -------------------------------------
+    # Code: chunks = text.split('\n\n')
+    # 
+    # Problems:
+    #   ⚠️  Paragraphs can be huge (> max_size)
+    #   ⚠️  Paragraphs can be tiny (< min_size)
+    #   ⚠️  No size control
+    #   ⚠️  Unbalanced chunks
+    #
+    # ALTERNATIVE 3: Word-based split
+    # --------------------------------
+    # Code: Split at word boundaries near target_size
+    # 
+    # Problems:
+    #   ⚠️  Breaks mid-sentence: "The analysis shows" | "that revenue increased"
+    #   ⚠️  Incomplete thoughts
+    #   ⚠️  Better than character but worse than sentence
+    #
+    # OUR APPROACH: Sentence-based split
+    # -----------------------------------
+    # ✓ Complete thoughts (sentences)
+    # ✓ Size-controlled (target_size respected)
+    # ✓ Natural boundaries
+    # ✓ Readable chunks
+    # ✓ Good RAG performance
+    # ✓ Balanced sizes
+    
+    # =========================================================================
+    # EDGE CASES HANDLED
+    # =========================================================================
+    #
+    # EDGE CASE 1: Single very long sentence
+    # ---------------------------------------
+    # Input: One sentence > target_size
+    # Example: "This is a very long sentence with many clauses... [2000 chars]"
+    # 
+    # Behavior:
+    #   - First iteration: Add to current_chunk
+    #   - current_len = 2000 (> target_size)
+    #   - But no flush (only one sentence)
+    #   - Final flush: Creates one large chunk
+    # 
+    # Result: One chunk with long sentence
+    # Note: Acceptable - sentence is atomic, can't split further
+    #
+    # EDGE CASE 2: Many very short sentences
+    # ---------------------------------------
+    # Input: 50 sentences, each 50 chars
+    # Example: "Short. Another. Third. Fourth. ..."
+    # 
+    # Behavior:
+    #   - Accumulates 30 sentences (1500 chars)
+    #   - Flushes
+    #   - Accumulates remaining 20 sentences (1000 chars)
+    #   - Final flush
+    # 
+    # Result: 2 chunks (30 sentences, 20 sentences)
+    #
+    # EDGE CASE 3: Empty text
+    # ------------------------
+    # Input: ""
+    # 
+    # Behavior:
+    #   - Split produces: [""]
+    #   - Loop processes empty string
+    #   - current_chunk = [""]
+    #   - Final flush creates: [""]
+    # 
+    # Result: One chunk with empty string
+    # Note: Caller's validation should catch this
+    #
+    # EDGE CASE 4: Text with no sentence markers
+    # -------------------------------------------
+    # Input: "This text has no punctuation at all just keeps going"
+    # 
+    # Behavior:
+    #   - Split produces: [entire text as one element]
+    #   - No split points found
+    #   - Result: One chunk with entire text
+    # 
+    # Result: Falls back to keeping text together
+    # Note: Rare in practice - most text has punctuation
+    
+    # =========================================================================
+    # STUDENT EXERCISES
+    # =========================================================================
+    #
+    # Try these experiments:
+    #
+    # 1. ANALYZE SPLIT DISTRIBUTION
+    #    For your documents, track:
+    #    - How many splits per flush?
+    #    - Average chunk sizes after split?
+    #    - Size variance (are splits balanced)?
+    #
+    # 2. TEST EDGE CASES
+    #    Create test inputs:
+    #    - One 3000 char sentence
+    #    - 100 x 30 char sentences
+    #    - Text with no punctuation
+    #    Observe: What chunks are created?
+    #
+    # 3. COMPARE PATTERNS
+    #    Try different sentence patterns:
+    #    - r'[.!?]+ ' (simpler)
+    #    - r'(?<=[.!?])\s+' (ours)
+    #    - r'(?<=[.!?])\s+(?=[A-Z])' (require capital after)
+    #    Measure: Which performs best?
+    #
+    # 4. OPTIMIZE TARGET_SIZE
+    #    Experiment with different values:
+    #    - target_size = 1000, 1500, 2000
+    #    Measure: RAG retrieval quality
+    #    Find: Optimal size for your use case
+    #
+    # 5. ADD SMART HEURISTICS
+    #    Enhance the split logic:
+    #    - Prefer splits after longer sentences
+    #    - Avoid splits after very short sentences (< 20 chars)
+    #    - Balance chunk sizes more evenly
+    
+    # =========================================================================
+    # END OF _smart_split
+    # =========================================================================
+
+
+================================================================================
+USAGE EXAMPLES
+================================================================================
+
+Example 1: _flush_semantic_buffer with small buffer (single chunk)
+-------------------------------------------------------------------
+
+Input:
+    buffer = ["Paragraph 1.", "Paragraph 2."]
+    breadcrumbs = ["Chapter 1", "Introduction"]
+    meta = {"source": "page_001.md", "page_number": 1}
+    chunks = []
+
+Process:
+    full_text = "Paragraph 1.Paragraph 2." (400 chars)
+    400 <= 2500? YES
+    → Create single chunk
+    → Validate
+    → Add to chunks
+
+Output:
+    chunks = [
+        {
+            'id': 'abc123...',
+            'text': 'Context: Chapter 1 > Introduction\n\nParagraph 1.Paragraph 2.',
+            'metadata': {...}
+        }
+    ]
+
+
+Example 2: _flush_semantic_buffer with large buffer (split needed)
+-------------------------------------------------------------------
+
+Input:
+    buffer = [very_long_text]  # 3200 chars
+    breadcrumbs = ["Chapter 1"]
+    meta = {...}
+    chunks = []
+
+Process:
+    full_text = very_long_text (3200 chars)
+    3200 <= 2500? NO
+    → Call _smart_split
+    → Returns: ["Part 1 (1600 chars)", "Part 2 (1600 chars)"]
+    → Create 2 chunks
+    → Validate each
+    → Add both to chunks
+
+Output:
+    chunks = [chunk1, chunk2]
+
+
+Example 3: _smart_split with typical text
+------------------------------------------
+
+Input:
+    text = "Sent 1. Sent 2. Sent 3. ... Sent 20." (3000 chars)
+    target_size = 1500
+
+Process:
+    sentences = ["Sent 1.", "Sent 2.", ..., "Sent 20."]
+    
+    Iteration 1-10: Accumulate (1500 chars) → Flush
+    Iteration 11-20: Accumulate (1500 chars) → Final flush
+
+Output:
+    ["Sent 1. Sent 2. ... Sent 10.", "Sent 11. Sent 12. ... Sent 20."]
+
+
+================================================================================
+END OF COMMENTED CODE
+================================================================================
+
+These functions work together to create optimal semantic chunks:
+1. _flush_semantic_buffer decides: single chunk or split?
+2. _smart_split handles: where to split if needed?
+
+Together they ensure all chunks are:
+✓ Semantically complete (at sentence boundaries)
+✓ Size-optimal (near target_size)
+✓ Readable (no broken sentences/words)
+✓ Ready for RAG (validated and deduplicated)

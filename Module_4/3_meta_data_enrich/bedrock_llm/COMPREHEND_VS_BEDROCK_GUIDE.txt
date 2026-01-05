@@ -1,0 +1,571 @@
+================================================================================
+COMPREHEND VS BEDROCK - COMPLETE COMPARISON GUIDE
+================================================================================
+
+This guide helps you choose between AWS Comprehend and AWS Bedrock (Claude)
+for metadata enrichment.
+
+QUICK DECISION TREE:
+════════════════════
+
+Need standard entities only? → Use Comprehend
+Need custom extraction? → Use Bedrock
+Processing millions of chunks? → Use Comprehend
+Quality > Cost? → Use Bedrock
+Budget constrained? → Use Comprehend
+Complex financial analysis? → Use Bedrock
+
+
+SECTION 1: FEATURE COMPARISON
+═══════════════════════════════════════════════════════════════════════════
+
+┌─────────────────────┬─────────────────────────┬──────────────────────────┐
+│ Feature             │ AWS Comprehend          │ AWS Bedrock (Claude)     │
+├─────────────────────┼─────────────────────────┼──────────────────────────┤
+│ Entity Types        │ 9 fixed types           │ Unlimited custom types   │
+│                     │ (PERSON, ORG, etc.)     │ (define your own)        │
+├─────────────────────┼─────────────────────────┼──────────────────────────┤
+│ Key Phrases         │ ✓ Automatic             │ ✓ Contextual             │
+├─────────────────────┼─────────────────────────┼──────────────────────────┤
+│ Sentiment Analysis  │ ✓ Basic                 │ ✓ Detailed + explanation │
+├─────────────────────┼─────────────────────────┼──────────────────────────┤
+│ Topic Extraction    │ ✗ Separate API          │ ✓ Built-in               │
+├─────────────────────┼─────────────────────────┼──────────────────────────┤
+│ Insights/Summary    │ ✗ Not available         │ ✓ Key insights extracted │
+├─────────────────────┼─────────────────────────┼──────────────────────────┤
+│ Relationships       │ ✗ Not available         │ ✓ Can extract            │
+├─────────────────────┼─────────────────────────┼──────────────────────────┤
+│ Custom Schema       │ ✗ Fixed output          │ ✓ Define your own        │
+├─────────────────────┼─────────────────────────┼──────────────────────────┤
+│ Accuracy            │ 90-95%                  │ 95-99%                   │
+├─────────────────────┼─────────────────────────┼──────────────────────────┤
+│ Speed (per chunk)   │ 50-100ms                │ 200-500ms                │
+├─────────────────────┼─────────────────────────┼──────────────────────────┤
+│ Rate Limit          │ 20 TPS                  │ 40 requests/min          │
+├─────────────────────┼─────────────────────────┼──────────────────────────┤
+│ Max Input Size      │ 5,000 chars             │ ~200,000 chars           │
+└─────────────────────┴─────────────────────────┴──────────────────────────┘
+
+
+SECTION 2: COST COMPARISON
+═══════════════════════════════════════════════════════════════════════════
+
+PRICING STRUCTURE:
+──────────────────
+
+AWS Comprehend:
+    Entities: $0.0001 per 100 characters
+    Key Phrases: $0.0001 per 100 characters
+    Total: $0.0002 per 100 characters
+
+AWS Bedrock (Claude 3.5 Sonnet):
+    Input: $3 per 1M tokens (~$0.004 per 1K tokens)
+    Output: $15 per 1M tokens (~$0.015 per 1K tokens)
+
+
+COST EXAMPLES:
+──────────────
+
+Single 500-Character Chunk:
+┌──────────────┬────────────────┬───────────────────┐
+│ Service      │ Calculation    │ Cost              │
+├──────────────┼────────────────┼───────────────────┤
+│ Comprehend   │ 500 × $0.0002  │ $0.001            │
+│              │ / 100          │                   │
+├──────────────┼────────────────┼───────────────────┤
+│ Bedrock      │ ~125 input +   │ $0.003            │
+│              │ ~200 output    │                   │
+│              │ tokens         │                   │
+└──────────────┴────────────────┴───────────────────┘
+Difference: 3x more expensive
+
+
+1,000 Chunks:
+┌──────────────┬────────────────────────────────────┐
+│ Service      │ Cost                               │
+├──────────────┼────────────────────────────────────┤
+│ Comprehend   │ $1.00                              │
+├──────────────┼────────────────────────────────────┤
+│ Bedrock      │ $3.00                              │
+├──────────────┼────────────────────────────────────┤
+│ Difference   │ +$2.00 (3x)                        │
+└──────────────┴────────────────────────────────────┘
+
+
+10,000 Chunks:
+┌──────────────┬────────────────────────────────────┐
+│ Service      │ Cost                               │
+├──────────────┼────────────────────────────────────┤
+│ Comprehend   │ $10.00                             │
+├──────────────┼────────────────────────────────────┤
+│ Bedrock      │ $30.00                             │
+├──────────────┼────────────────────────────────────┤
+│ Difference   │ +$20.00 (3x)                       │
+└──────────────┴────────────────────────────────────┘
+
+
+100,000 Chunks:
+┌──────────────┬────────────────────────────────────┐
+│ Service      │ Cost                               │
+├──────────────┼────────────────────────────────────┤
+│ Comprehend   │ $100.00                            │
+├──────────────┼────────────────────────────────────┤
+│ Bedrock      │ $300.00                            │
+├──────────────┼────────────────────────────────────┤
+│ Difference   │ +$200.00 (3x)                      │
+└──────────────┴────────────────────────────────────┘
+
+
+COST OPTIMIZATION:
+──────────────────
+
+Hybrid Approach (Best of Both):
+    Important chunks (10%): Bedrock → $3
+    Standard chunks (90%): Comprehend → $9
+    Total for 10K chunks: $12
+    
+    Savings: $18 vs all-Bedrock
+    Quality: High-value chunks get best analysis
+
+
+SECTION 3: OUTPUT COMPARISON
+═══════════════════════════════════════════════════════════════════════════
+
+Sample Text:
+"Morgan Stanley reported Q3 2024 revenue of $15.4B, representing 25% growth
+year-over-year. CEO James Gorman highlighted strong performance in investment
+banking, with M&A advisory fees up 30%. The company's EBITDA margin improved
+to 28%, and EPS reached $2.15."
+
+
+COMPREHEND OUTPUT:
+──────────────────
+
+{
+  "entities": {
+    "organizations": [
+      {"text": "Morgan Stanley", "confidence": 0.9987}
+    ],
+    "people": [
+      {"text": "James Gorman", "confidence": 0.9956}
+    ],
+    "titles": [
+      {"text": "CEO", "confidence": 0.9823}
+    ],
+    "dates": [
+      {"text": "Q3 2024", "confidence": 0.9891}
+    ],
+    "quantities": [
+      {"text": "$15.4B", "confidence": 0.9654},
+      {"text": "25%", "confidence": 0.9789},
+      {"text": "30%", "confidence": 0.9712},
+      {"text": "28%", "confidence": 0.9801},
+      {"text": "$2.15", "confidence": 0.9623}
+    ]
+  },
+  "key_phrases": [
+    "Morgan Stanley",
+    "Q3 2024 revenue",
+    "year-over-year",
+    "investment banking",
+    "M&A advisory fees",
+    "EBITDA margin",
+    "strong performance"
+  ],
+  "monetary_values": ["$15.4B", "$2.15"],
+  "percentages": ["30%", "28%", "25%"],
+  "quarters": ["Q3 2024"],
+  "financial_metrics": ["revenue", "ebitda", "eps"]
+}
+
+
+BEDROCK OUTPUT:
+───────────────
+
+{
+  "entities": {
+    "organizations": ["Morgan Stanley"],
+    "people": ["James Gorman"],
+    "locations": [],
+    "dates": ["Q3 2024", "year-over-year"],
+    "quantities": ["$15.4B", "25%", "30%", "28%", "$2.15"],
+    "titles": ["CEO"],
+    "events": [],
+    "products": []
+  },
+  "key_phrases": [
+    "Q3 2024 revenue growth",
+    "year-over-year performance",
+    "investment banking strength",
+    "M&A advisory fee increase",
+    "EBITDA margin improvement",
+    "earnings per share"
+  ],
+  "financial_metrics": [
+    "revenue",
+    "growth",
+    "investment banking fees",
+    "M&A advisory fees",
+    "EBITDA margin",
+    "EPS"
+  ],
+  "sentiment": {
+    "label": "positive",
+    "explanation": "Strong financial performance with revenue growth,
+                     margin improvement, and positive management commentary"
+  },
+  "topics": [
+    "quarterly financial results",
+    "revenue growth",
+    "investment banking performance",
+    "profitability metrics"
+  ],
+  "key_insights": [
+    "Morgan Stanley achieved 25% YoY revenue growth in Q3 2024",
+    "Investment banking showed particularly strong performance with 30%
+     increase in M&A advisory fees",
+    "Profitability improved with EBITDA margin reaching 28% and EPS of $2.15"
+  ],
+  "monetary_values": ["$15.4B", "$2.15"],
+  "percentages": ["30%", "28%", "25%"],
+  "quarters": ["Q3 2024"],
+  "financial_metrics_regex": ["revenue", "ebitda", "eps"]
+}
+
+
+KEY DIFFERENCES:
+────────────────
+
+✓ Comprehend: Clean, structured, reliable
+✓ Bedrock: Richer, contextual, insightful
+
+Bedrock provides:
++ Sentiment with explanation
++ Topic classification
++ Key insights (summaries)
++ More contextual key phrases
++ Better understanding of relationships
+
+
+SECTION 4: USE CASE RECOMMENDATIONS
+═══════════════════════════════════════════════════════════════════════════
+
+USE COMPREHEND WHEN:
+════════════════════
+
+✓ Standard entity extraction is sufficient
+    Example: "Just need to extract company names and dates"
+
+✓ Processing high volume (millions of chunks)
+    Example: "We process 10M documents monthly"
+    Cost difference: $10K vs $30K
+
+✓ Budget is constrained
+    Example: "Need to keep costs under $100"
+
+✓ Speed is critical
+    Comprehend: 50-100ms per chunk
+    Bedrock: 200-500ms per chunk
+
+✓ Simple RAG system
+    Example: "Just filter by company, date, and location"
+
+✓ Reliability > flexibility
+    Example: "Need consistent, predictable output"
+
+
+USE BEDROCK WHEN:
+═════════════════
+
+✓ Need custom entity types
+    Example: "Extract risks, opportunities, strategic initiatives"
+
+✓ Need semantic understanding
+    Example: "Understand sentiment, intent, relationships"
+
+✓ Need insights/summaries
+    Example: "What are the key takeaways from each chunk?"
+
+✓ Complex financial analysis
+    Example: "Analyze management tone, extract forward-looking statements"
+
+✓ Quality > cost
+    Example: "Budget is $500, quality is paramount"
+
+✓ Domain-specific extraction
+    Example: "Extract specific legal clauses, regulatory requirements"
+
+✓ Structured data extraction
+    Example: "Extract tables, key-value pairs, hierarchical data"
+
+
+HYBRID APPROACH (BEST OF BOTH):
+═══════════════════════════════
+
+Strategy:
+    1. Use Comprehend for all chunks (baseline)
+    2. Use Bedrock for important chunks (10-20%)
+    
+Implementation:
+    if chunk.metadata.get('importance') == 'high':
+        enricher = BedrockMetadataEnricher()
+    else:
+        enricher = MetadataEnricher()  # Comprehend
+    
+    enriched = enricher.enrich_chunk(chunk)
+
+Benefits:
+    - Cost-effective (mostly Comprehend)
+    - High quality where it matters (Bedrock for important chunks)
+    - Best of both worlds
+
+
+SECTION 5: PRACTICAL EXAMPLES
+═══════════════════════════════════════════════════════════════════════════
+
+EXAMPLE 1: Financial Research Firm
+───────────────────────────────────
+
+Scenario:
+    - 50K financial documents
+    - Need to extract companies, metrics, insights
+    - Quality is critical
+    - Budget: $2,000
+
+Recommendation: BEDROCK
+    Cost: 50K chunks × $0.003 = $150
+    Why: Well within budget, quality critical
+    
+
+EXAMPLE 2: News Aggregation Platform
+─────────────────────────────────────
+
+Scenario:
+    - 10M articles monthly
+    - Need entities for tagging
+    - Speed is critical
+    - Budget: $5,000
+
+Recommendation: COMPREHEND
+    Cost: 10M chunks × $0.001 = $10,000 (over budget!)
+    Alternative: Use Bedrock for trending articles only
+    
+
+EXAMPLE 3: Legal Document Analysis
+───────────────────────────────────
+
+Scenario:
+    - 1K legal contracts
+    - Need custom extraction (clauses, obligations, terms)
+    - Very high quality needed
+    - Budget: $500
+
+Recommendation: BEDROCK
+    Cost: 1K chunks × $0.003 = $3
+    Why: Custom extraction, high quality, well within budget
+
+
+EXAMPLE 4: Customer Support Analysis
+─────────────────────────────────────
+
+Scenario:
+    - 100K support tickets
+    - Need sentiment + topics
+    - Moderate budget
+    - Budget: $500
+
+Recommendation: HYBRID
+    All tickets with Comprehend: $100
+    Escalated tickets with Bedrock (10%): $30
+    Total: $130
+    Why: Cost-effective, deep analysis where needed
+
+
+SECTION 6: IMPLEMENTATION GUIDE
+═══════════════════════════════════════════════════════════════════════════
+
+USING COMPREHEND:
+─────────────────
+
+```python
+from metadata_enricher import MetadataEnricher
+from enrich_chunks import ChunkEnrichmentPipeline
+
+# Create enricher
+enricher = MetadataEnricher(
+    region_name='us-east-1',
+    enable_comprehend=True,
+    confidence_threshold=0.7
+)
+
+# Create pipeline
+pipeline = ChunkEnrichmentPipeline(
+    region_name='us-east-1',
+    enable_comprehend=True
+)
+
+# Process chunks
+pipeline.process('chunks_output.json')
+```
+
+Command line:
+```bash
+python enrich_chunks.py chunks_output.json
+```
+
+
+USING BEDROCK:
+──────────────
+
+```python
+from metadata_enricher_bedrock import BedrockMetadataEnricher
+from enrich_chunks_bedrock import BedrockChunkEnrichmentPipeline
+
+# Create enricher
+enricher = BedrockMetadataEnricher(
+    region_name='us-east-1',
+    model_id='anthropic.claude-3-5-sonnet-20241022-v1:0',
+    temperature=0.0
+)
+
+# Create pipeline
+pipeline = BedrockChunkEnrichmentPipeline(
+    region_name='us-east-1',
+    model_id='anthropic.claude-3-5-sonnet-20241022-v1:0'
+)
+
+# Process chunks
+pipeline.process('chunks_output.json')
+```
+
+Command line:
+```bash
+python enrich_chunks_bedrock.py chunks_output.json
+```
+
+
+HYBRID APPROACH:
+────────────────
+
+```python
+from metadata_enricher import MetadataEnricher
+from metadata_enricher_bedrock import BedrockMetadataEnricher
+
+# Initialize both enrichers
+comprehend_enricher = MetadataEnricher()
+bedrock_enricher = BedrockMetadataEnricher()
+
+# Process chunks
+for chunk in chunks:
+    # Decide which enricher to use
+    if is_important(chunk):
+        enriched = bedrock_enricher.enrich_chunk(chunk)
+    else:
+        enriched = comprehend_enricher.enrich_chunk(chunk)
+    
+    save_chunk(enriched)
+```
+
+
+SECTION 7: FILE COMPARISON
+═══════════════════════════════════════════════════════════════════════════
+
+FILES FOR COMPREHEND:
+─────────────────────
+- metadata_enricher.py              (Core enricher)
+- enrich_chunks.py                  (Pipeline)
+- METADATA_ENRICHER_USAGE_GUIDE.txt (Guide)
+- metadata_enricher_EDUCATIONAL.py  (Learning)
+- enrich_chunks_COMMENTED.py        (Learning)
+
+
+FILES FOR BEDROCK:
+──────────────────
+- metadata_enricher_bedrock.py      (Core enricher)
+- enrich_chunks_bedrock.py          (Pipeline)
+- COMPREHEND_VS_BEDROCK_GUIDE.txt   (This file)
+
+
+WHICH FILES TO USE:
+───────────────────
+
+For Comprehend only:
+    → Use: metadata_enricher.py, enrich_chunks.py
+
+For Bedrock only:
+    → Use: metadata_enricher_bedrock.py, enrich_chunks_bedrock.py
+
+For Hybrid:
+    → Use: Both sets, write custom logic to choose
+
+
+SECTION 8: QUICK REFERENCE
+═══════════════════════════════════════════════════════════════════════════
+
+COST MULTIPLIERS:
+─────────────────
+Bedrock is 3x more expensive than Comprehend
+
+
+ACCURACY:
+─────────
+Comprehend: 90-95%
+Bedrock: 95-99%
+
+
+SPEED:
+──────
+Comprehend: 2x faster than Bedrock
+
+
+FLEXIBILITY:
+────────────
+Bedrock: Unlimited customization
+Comprehend: Fixed 9 entity types
+
+
+BEST USE CASES:
+───────────────
+Comprehend: High volume, standard entities, budget-constrained
+Bedrock: Custom extraction, deep analysis, quality-critical
+
+
+DECISION MATRIX:
+────────────────
+
+┌──────────────────┬─────────────┬──────────┐
+│ Priority         │ Choice      │ Reason   │
+├──────────────────┼─────────────┼──────────┤
+│ Cost             │ Comprehend  │ 3x less  │
+│ Speed            │ Comprehend  │ 2x fast  │
+│ Quality          │ Bedrock     │ 95-99%   │
+│ Customization    │ Bedrock     │ Flexible │
+│ Simple entities  │ Comprehend  │ Easier   │
+│ Complex analysis │ Bedrock     │ LLM      │
+│ High volume      │ Comprehend  │ Cheaper  │
+│ Low volume       │ Bedrock     │ Quality  │
+└──────────────────┴─────────────┴──────────┘
+
+
+SUMMARY:
+────────
+
+Comprehend: Fast, cheap, reliable, standard
+Bedrock: Flexible, smart, expensive, custom
+
+For most use cases: START with Comprehend
+If you need custom extraction: Use Bedrock
+If budget allows: Use Bedrock for quality
+If high volume: Use Comprehend
+
+
+================================================================================
+END OF COMPARISON GUIDE
+================================================================================
+
+For more information:
+- Comprehend documentation: METADATA_ENRICHER_USAGE_GUIDE.txt
+- Bedrock examples: metadata_enricher_bedrock.py
+- Educational resources: metadata_enricher_EDUCATIONAL.py
+
+Questions? Check the example files for complete code samples!

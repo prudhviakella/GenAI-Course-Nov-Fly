@@ -1,0 +1,934 @@
+================================================================================
+METADATA ENRICHMENT FOR SEMANTIC CHUNKS - Complete AWS Strategy
+================================================================================
+
+This guide explains how to generate rich metadata for each chunk using AWS
+services and other techniques to dramatically improve RAG retrieval quality.
+
+
+================================================================================
+1. WHY METADATA MATTERS FOR RAG
+================================================================================
+
+THE PROBLEM WITH BASIC CHUNKS:
+───────────────────────────────
+
+Basic chunk (no metadata):
+┌─────────────────────────────────────────────────────────────┐
+│ {                                                            │
+│   "text": "Morgan Stanley reported Q3 revenue of $15.4B...", │
+│   "chunk_id": "abc123"                                       │
+│ }                                                            │
+└─────────────────────────────────────────────────────────────┘
+
+Problems:
+❌ No filtering capability (can't find "all finance chunks")
+❌ No entity search (can't find "all Morgan Stanley mentions")
+❌ No temporal filtering (can't find "Q3 2024 results")
+❌ No topic classification (don't know it's about earnings)
+
+
+ENRICHED CHUNK WITH METADATA:
+──────────────────────────────
+
+┌─────────────────────────────────────────────────────────────┐
+│ {                                                            │
+│   "text": "Morgan Stanley reported Q3 revenue of $15.4B...", │
+│   "chunk_id": "abc123",                                      │
+│   "metadata": {                                              │
+│     "entities": {                                            │
+│       "organizations": ["Morgan Stanley"],                   │
+│       "financial_metrics": ["revenue", "Q3"],                │
+│       "monetary_values": ["$15.4B"]                          │
+│     },                                                       │
+│     "keywords": ["earnings", "revenue", "quarterly"],        │
+│     "topics": ["Financial Performance", "Earnings Report"],  │
+│     "sentiment": "POSITIVE",                                 │
+│     "sentiment_score": 0.87,                                 │
+│     "temporal": {                                            │
+│       "quarter": "Q3",                                       │
+│       "year": "2024",                                        │
+│       "date_mentioned": "2024-10-15"                         │
+│     },                                                       │
+│     "document_type": "Earnings Report",                      │
+│     "key_phrases": ["Q3 revenue growth", "year-over-year"], │
+│     "language": "en",                                        │
+│     "pii_detected": false                                    │
+│   }                                                          │
+│ }                                                            │
+└─────────────────────────────────────────────────────────────┘
+
+Benefits:
+✓ Filter by entity: "Show all Morgan Stanley chunks"
+✓ Filter by topic: "Find all earnings report chunks"
+✓ Filter by time: "Q3 2024 results only"
+✓ Filter by sentiment: "Positive financial news"
+✓ Hybrid search: Vector + metadata filters
+✓ Better ranking: Combine semantic + metadata relevance
+
+
+================================================================================
+2. AWS COMPREHEND - THE FOUNDATION
+================================================================================
+
+WHAT IS AWS COMPREHEND?
+───────────────────────
+
+Amazon Comprehend is a natural language processing (NLP) service that uses
+machine learning to extract insights from text.
+
+Official page: https://aws.amazon.com/comprehend/
+
+
+CORE CAPABILITIES:
+──────────────────
+
+1. Named Entity Recognition (NER)
+2. Key Phrase Extraction
+3. Sentiment Analysis
+4. Topic Modeling
+5. Language Detection
+6. PII Detection and Redaction
+7. Syntax Analysis
+8. Custom Entity Recognition
+
+
+COMPREHEND STANDARD VS MEDICAL:
+────────────────────────────────
+
+┌──────────────────────┬─────────────────────┬────────────────────┐
+│ Feature              │ Comprehend Standard │ Comprehend Medical │
+├──────────────────────┼─────────────────────┼────────────────────┤
+│ General entities     │ ✓ Yes               │ ✗ No               │
+│ Medical entities     │ ✗ No                │ ✓ Yes              │
+│ Custom entities      │ ✓ Yes (train model) │ ✗ No               │
+│ Key phrases          │ ✓ Yes               │ ✓ Yes              │
+│ Sentiment            │ ✓ Yes               │ ✓ Yes              │
+│ Use case             │ General documents   │ Medical records    │
+│ Cost                 │ Lower               │ Higher             │
+└──────────────────────┴─────────────────────┴────────────────────┘
+
+Recommendation: Use Comprehend Standard for financial/business documents
+
+
+================================================================================
+3. COMPREHEND ENTITY TYPES - WHAT YOU GET
+================================================================================
+
+BUILT-IN ENTITY TYPES:
+──────────────────────
+
+Amazon Comprehend Standard detects these entity types out-of-the-box:
+
+1. PERSON
+   Example: "John Smith", "Sarah Johnson", "Dr. Williams"
+   
+2. LOCATION
+   Example: "New York", "United States", "Silicon Valley"
+   
+3. ORGANIZATION
+   Example: "Morgan Stanley", "Microsoft", "Federal Reserve"
+   
+4. COMMERCIAL_ITEM
+   Example: "iPhone 15", "AWS Lambda", "Tesla Model 3"
+   
+5. EVENT
+   Example: "World War II", "Super Bowl", "Q3 Earnings Call"
+   
+6. DATE
+   Example: "October 15, 2024", "Q3 2024", "last quarter"
+   
+7. QUANTITY
+   Example: "1 million", "25%", "three quarters"
+   
+8. TITLE
+   Example: "CEO", "Chief Financial Officer", "President"
+   
+9. OTHER
+   Example: Miscellaneous entities that don't fit above categories
+
+
+EXAMPLE OUTPUT:
+───────────────
+
+Input text:
+"Morgan Stanley CEO James Gorman announced Q3 2024 revenue of $15.4B,
+ representing 25% growth year-over-year."
+
+Comprehend NER output:
+```json
+{
+  "Entities": [
+    {
+      "Text": "Morgan Stanley",
+      "Type": "ORGANIZATION",
+      "Score": 0.9987,
+      "BeginOffset": 0,
+      "EndOffset": 14
+    },
+    {
+      "Text": "CEO",
+      "Type": "TITLE",
+      "Score": 0.9823,
+      "BeginOffset": 15,
+      "EndOffset": 18
+    },
+    {
+      "Text": "James Gorman",
+      "Type": "PERSON",
+      "Score": 0.9956,
+      "BeginOffset": 19,
+      "EndOffset": 31
+    },
+    {
+      "Text": "Q3 2024",
+      "Type": "DATE",
+      "Score": 0.9891,
+      "BeginOffset": 42,
+      "EndOffset": 49
+    },
+    {
+      "Text": "$15.4B",
+      "Type": "QUANTITY",
+      "Score": 0.9654,
+      "BeginOffset": 61,
+      "EndOffset": 67
+    },
+    {
+      "Text": "25%",
+      "Type": "QUANTITY",
+      "Score": 0.9789,
+      "BeginOffset": 83,
+      "EndOffset": 86
+    }
+  ]
+}
+```
+
+
+================================================================================
+4. COMPREHENSIVE METADATA STRATEGY - ALL AWS SERVICES
+================================================================================
+
+Here's the complete strategy using multiple AWS services:
+
+SERVICE 1: AWS COMPREHEND (Primary)
+════════════════════════════════════
+
+API: boto3.client('comprehend')
+
+Features to use:
+
+1. detect_entities()
+   - Extracts named entities (people, orgs, dates, quantities)
+   - Cost: $0.0001 per 100 characters (~$1 per 1M chars)
+   - Use for: Entity-based filtering and search
+
+2. detect_key_phrases()
+   - Extracts important phrases (2-3 word combinations)
+   - Cost: $0.0001 per 100 characters
+   - Use for: Keyword extraction, phrase-based search
+
+3. detect_sentiment()
+   - Determines sentiment (POSITIVE, NEGATIVE, NEUTRAL, MIXED)
+   - Returns confidence scores for each sentiment
+   - Cost: $0.0001 per 100 characters
+   - Use for: Sentiment filtering, ranking positive content
+
+4. detect_dominant_language()
+   - Identifies language of text (99 languages supported)
+   - Cost: $0.0001 per 100 characters
+   - Use for: Multi-language document handling
+
+5. detect_pii_entities()
+   - Detects personally identifiable information
+   - Types: SSN, email, phone, credit card, address, etc.
+   - Cost: $0.0001 per 100 characters
+   - Use for: Privacy compliance, redaction
+
+6. classify_document() - Custom Classification
+   - Train custom classifier for your document types
+   - Training cost: $3 per hour (one-time)
+   - Inference cost: $0.0005 per classification
+   - Use for: Document type classification
+
+Example code:
+```python
+import boto3
+
+comprehend = boto3.client('comprehend', region_name='us-east-1')
+
+# Named Entity Recognition
+entities_response = comprehend.detect_entities(
+    Text=chunk_text,
+    LanguageCode='en'
+)
+
+# Key Phrases
+phrases_response = comprehend.detect_key_phrases(
+    Text=chunk_text,
+    LanguageCode='en'
+)
+
+# Sentiment
+sentiment_response = comprehend.detect_sentiment(
+    Text=chunk_text,
+    LanguageCode='en'
+)
+
+# PII Detection
+pii_response = comprehend.detect_pii_entities(
+    Text=chunk_text,
+    LanguageCode='en'
+)
+```
+
+
+SERVICE 2: AWS TEXTRACT (For PDF Documents)
+════════════════════════════════════════════
+
+API: boto3.client('textract')
+
+If you're processing PDFs directly (not just markdown):
+
+Features:
+1. detect_document_text()
+   - Extract text with layout information
+   - Get bounding boxes, confidence scores
+   
+2. analyze_document()
+   - Extract tables, forms, key-value pairs
+   - Identify document structure
+   
+3. analyze_expense()
+   - Extract invoice/receipt information
+   - Get line items, totals, vendors
+
+Use for:
+- Better table extraction than markdown
+- Form field identification
+- Invoice/expense document metadata
+
+Cost: $1.50 per 1000 pages (detect_document_text)
+
+
+SERVICE 3: AWS BEDROCK (For Advanced Analysis)
+═══════════════════════════════════════════════
+
+API: boto3.client('bedrock-runtime')
+
+Use Claude/other LLMs via Bedrock for:
+
+1. Custom Metadata Extraction
+   - Extract domain-specific entities
+   - Generate summaries
+   - Answer questions about chunk content
+
+2. Topic Classification
+   - Classify chunks into custom topics
+   - More accurate than generic classifiers
+
+3. Intent Detection
+   - What is the chunk about?
+   - What questions does it answer?
+
+Example:
+```python
+import boto3
+import json
+
+bedrock = boto3.client('bedrock-runtime', region_name='us-east-1')
+
+prompt = f"""
+Analyze this text and extract metadata as JSON:
+- Main topic (1-2 words)
+- Key financial metrics mentioned
+- Companies mentioned
+- Time period discussed
+- Document type (earnings, analysis, news, etc.)
+
+Text: {chunk_text}
+
+Return only JSON, no explanation.
+"""
+
+response = bedrock.invoke_model(
+    modelId='anthropic.claude-3-sonnet-20240229-v1:0',
+    body=json.dumps({
+        'messages': [{'role': 'user', 'content': prompt}],
+        'max_tokens': 500,
+        'anthropic_version': 'bedrock-2023-05-31'
+    })
+)
+
+metadata = json.loads(response['body'].read())
+```
+
+Cost: ~$0.003 per 1K input tokens, ~$0.015 per 1K output tokens
+(More expensive than Comprehend, but more flexible)
+
+
+SERVICE 4: AWS KENDRA (For ML-Powered Indexing)
+════════════════════════════════════════════════
+
+API: boto3.client('kendra')
+
+Kendra can extract metadata automatically:
+
+Features:
+1. Automatic entity extraction
+2. FAQ extraction
+3. Document attributes indexing
+4. Custom metadata fields
+
+Use if:
+- Building search application
+- Want managed service
+- Need FAQ extraction
+
+Cost: $1.40/hour for Developer Edition (expensive)
+
+
+SERVICE 5: AWS TRANSLATE (For Multi-Language)
+══════════════════════════════════════════════
+
+API: boto3.client('translate')
+
+If documents in multiple languages:
+
+Features:
+1. translate_text()
+   - Translate to English for processing
+   - Preserve original + translated versions
+
+2. Custom terminology
+   - Define domain-specific translations
+   - Ensure consistency
+
+Use for:
+- Multi-language document processing
+- Translate before Comprehend analysis
+
+Cost: $15 per 1M characters
+
+
+================================================================================
+5. RECOMMENDED METADATA ARCHITECTURE
+================================================================================
+
+TIER 1: BASIC (Always Include)
+═══════════════════════════════
+
+Use: Built-in extraction during chunking
+
+Metadata:
+- chunk_id (MD5 hash)
+- source_file
+- page_number
+- chunk_position (which chunk in sequence)
+- char_count
+- word_count
+- breadcrumbs (hierarchical context)
+- chunk_type (text, table, image, code)
+
+Cost: $0 (part of chunking process)
+
+
+TIER 2: STANDARD (Recommended)
+═══════════════════════════════
+
+Use: AWS Comprehend Standard
+
+Metadata:
+- entities (people, orgs, locations, dates, quantities)
+- key_phrases (2-3 word important phrases)
+- sentiment (POSITIVE/NEGATIVE/NEUTRAL/MIXED)
+- sentiment_scores (confidence for each sentiment)
+- language (detected language code)
+- pii_detected (boolean flag)
+
+Cost: ~$0.0005 per chunk (assuming 500 chars per chunk)
+For 10,000 chunks: ~$5
+
+Implementation:
+```python
+def enrich_chunk_with_comprehend(chunk_text):
+    comprehend = boto3.client('comprehend')
+    
+    # Entities
+    entities = comprehend.detect_entities(
+        Text=chunk_text, 
+        LanguageCode='en'
+    )
+    
+    # Key phrases
+    phrases = comprehend.detect_key_phrases(
+        Text=chunk_text,
+        LanguageCode='en'
+    )
+    
+    # Sentiment
+    sentiment = comprehend.detect_sentiment(
+        Text=chunk_text,
+        LanguageCode='en'
+    )
+    
+    return {
+        'entities': process_entities(entities),
+        'key_phrases': [p['Text'] for p in phrases['KeyPhrases']],
+        'sentiment': sentiment['Sentiment'],
+        'sentiment_scores': sentiment['SentimentScore']
+    }
+```
+
+
+TIER 3: ADVANCED (For High-Value Documents)
+════════════════════════════════════════════
+
+Use: AWS Bedrock (Claude) for custom extraction
+
+Metadata:
+- Custom entities (domain-specific)
+- Topic classification (your categories)
+- Summary (1-sentence description)
+- Answerable questions (what queries this chunk addresses)
+- Financial metrics (custom extraction)
+- Relationships (how entities relate)
+
+Cost: ~$0.01 per chunk (assuming 500 char input, 200 char output)
+For 10,000 chunks: ~$100
+
+Implementation:
+```python
+def enrich_chunk_with_bedrock(chunk_text):
+    bedrock = boto3.client('bedrock-runtime')
+    
+    prompt = f"""
+    Extract structured metadata from this financial text:
+    
+    Required fields:
+    - main_topic: One of [Earnings, M&A, Market Analysis, Strategy, Risk]
+    - financial_metrics: List of metrics mentioned (e.g., revenue, EBITDA)
+    - companies: All companies mentioned
+    - time_period: Quarter/year discussed
+    - key_insight: One sentence summary
+    
+    Text: {chunk_text}
+    
+    Return JSON only.
+    """
+    
+    response = bedrock.invoke_model(
+        modelId='anthropic.claude-3-haiku-20240307-v1:0',  # Use Haiku for cost
+        body=json.dumps({
+            'messages': [{'role': 'user', 'content': prompt}],
+            'max_tokens': 300,
+            'anthropic_version': 'bedrock-2023-05-31'
+        })
+    )
+    
+    return json.loads(response['body'].read())
+```
+
+
+================================================================================
+6. OPTIMAL STRATEGY: HYBRID APPROACH
+================================================================================
+
+RECOMMENDATION:
+───────────────
+
+Use a combination based on document value and use case:
+
+Strategy A: Cost-Optimized (For Large Volumes)
+───────────────────────────────────────────────
+
+1. Built-in extraction (free)
+   - Basic metadata from chunking process
+   
+2. AWS Comprehend Standard
+   - Entities, key phrases, sentiment
+   - $0.0005 per chunk
+   
+3. Custom regex patterns (free)
+   - Financial patterns: $XXX, XX%, QX XXXX
+   - Date patterns: YYYY-MM-DD, Q[1-4] YYYY
+   - Metric patterns: revenue, EBITDA, growth
+
+Total cost: ~$5 per 10K chunks
+
+
+Strategy B: Quality-Optimized (For High-Value Documents)
+─────────────────────────────────────────────────────────
+
+1. Built-in extraction (free)
+2. AWS Comprehend Standard ($0.0005/chunk)
+3. Custom regex patterns (free)
+4. AWS Bedrock for 10% of chunks ($0.01/chunk)
+   - Only for chunks with high importance
+   - Chunks containing financial metrics
+   - Chunks in earnings sections
+
+Total cost: ~$15 per 10K chunks
+
+
+Strategy C: Real-Time Optimized (For Production RAG)
+─────────────────────────────────────────────────────
+
+1. Pre-compute Tier 1 & 2 during indexing
+   - Store in vector DB metadata
+   
+2. Compute Tier 3 on-demand during retrieval
+   - Only for chunks that are retrieved
+   - 5-10 chunks per query × $0.01 = $0.05-$0.10 per query
+
+
+================================================================================
+7. IMPLEMENTATION EXAMPLE
+================================================================================
+
+Complete metadata enrichment pipeline:
+
+```python
+import boto3
+import re
+from typing import Dict, List
+
+class MetadataEnricher:
+    def __init__(self):
+        self.comprehend = boto3.client('comprehend', region_name='us-east-1')
+        self.bedrock = boto3.client('bedrock-runtime', region_name='us-east-1')
+    
+    def enrich_chunk(
+        self, 
+        chunk: Dict, 
+        tier: str = 'standard'
+    ) -> Dict:
+        """
+        Enrich chunk with metadata based on tier.
+        
+        Parameters
+        ----------
+        chunk : Dict
+            Chunk dictionary with 'content_only' field
+        tier : str
+            'basic', 'standard', or 'advanced'
+        
+        Returns
+        -------
+        Dict
+            Chunk with enriched metadata
+        """
+        text = chunk['content_only']
+        
+        # Tier 1: Basic (already have from chunking)
+        # No additional processing needed
+        
+        # Tier 2: Standard (Comprehend)
+        if tier in ['standard', 'advanced']:
+            chunk['metadata'].update(
+                self._comprehend_analysis(text)
+            )
+        
+        # Tier 3: Advanced (Bedrock)
+        if tier == 'advanced':
+            chunk['metadata'].update(
+                self._bedrock_analysis(text)
+            )
+        
+        # Custom patterns (always run - free)
+        chunk['metadata'].update(
+            self._custom_patterns(text)
+        )
+        
+        return chunk
+    
+    def _comprehend_analysis(self, text: str) -> Dict:
+        """Run AWS Comprehend analysis."""
+        results = {}
+        
+        # Entities
+        try:
+            entities_response = self.comprehend.detect_entities(
+                Text=text[:5000],  # Comprehend limit
+                LanguageCode='en'
+            )
+            
+            results['entities'] = self._process_entities(
+                entities_response['Entities']
+            )
+        except Exception as e:
+            print(f"Entity detection failed: {e}")
+            results['entities'] = {}
+        
+        # Key Phrases
+        try:
+            phrases_response = self.comprehend.detect_key_phrases(
+                Text=text[:5000],
+                LanguageCode='en'
+            )
+            
+            results['key_phrases'] = [
+                p['Text'] for p in phrases_response['KeyPhrases'][:10]
+            ]
+        except Exception as e:
+            print(f"Key phrase detection failed: {e}")
+            results['key_phrases'] = []
+        
+        # Sentiment
+        try:
+            sentiment_response = self.comprehend.detect_sentiment(
+                Text=text[:5000],
+                LanguageCode='en'
+            )
+            
+            results['sentiment'] = sentiment_response['Sentiment']
+            results['sentiment_scores'] = sentiment_response['SentimentScore']
+        except Exception as e:
+            print(f"Sentiment detection failed: {e}")
+            results['sentiment'] = 'NEUTRAL'
+            results['sentiment_scores'] = {}
+        
+        # Language
+        try:
+            language_response = self.comprehend.detect_dominant_language(
+                Text=text[:5000]
+            )
+            
+            results['language'] = language_response['Languages'][0]['LanguageCode']
+        except Exception as e:
+            results['language'] = 'en'
+        
+        return results
+    
+    def _process_entities(self, entities: List[Dict]) -> Dict:
+        """Organize entities by type."""
+        organized = {
+            'people': [],
+            'organizations': [],
+            'locations': [],
+            'dates': [],
+            'quantities': [],
+            'titles': [],
+            'events': [],
+            'other': []
+        }
+        
+        type_mapping = {
+            'PERSON': 'people',
+            'ORGANIZATION': 'organizations',
+            'LOCATION': 'locations',
+            'DATE': 'dates',
+            'QUANTITY': 'quantities',
+            'TITLE': 'titles',
+            'EVENT': 'events',
+            'OTHER': 'other',
+            'COMMERCIAL_ITEM': 'other'
+        }
+        
+        for entity in entities:
+            if entity['Score'] > 0.7:  # Confidence threshold
+                category = type_mapping.get(entity['Type'], 'other')
+                organized[category].append({
+                    'text': entity['Text'],
+                    'confidence': entity['Score']
+                })
+        
+        # Remove duplicates
+        for category in organized:
+            seen = set()
+            unique = []
+            for item in organized[category]:
+                if item['text'] not in seen:
+                    seen.add(item['text'])
+                    unique.append(item)
+            organized[category] = unique
+        
+        return organized
+    
+    def _bedrock_analysis(self, text: str) -> Dict:
+        """Run AWS Bedrock (Claude) analysis."""
+        try:
+            prompt = f"""Extract metadata from this financial text as JSON:
+
+Required fields:
+- main_topic: One of [Earnings, M&A, Market_Analysis, Strategy, Risk, General]
+- sub_topics: List of 2-3 specific sub-topics
+- financial_metrics: List of metrics mentioned (revenue, profit, EBITDA, etc.)
+- time_period: Quarter and year if mentioned (e.g., "Q3 2024")
+- key_insight: One concise sentence summarizing the main point
+- document_section: Type of section (introduction, analysis, conclusion, etc.)
+
+Text: {text[:2000]}
+
+Return only valid JSON, no explanation."""
+
+            response = self.bedrock.invoke_model(
+                modelId='anthropic.claude-3-haiku-20240307-v1:0',
+                body=json.dumps({
+                    'messages': [{'role': 'user', 'content': prompt}],
+                    'max_tokens': 400,
+                    'temperature': 0,
+                    'anthropic_version': 'bedrock-2023-05-31'
+                })
+            )
+            
+            response_body = json.loads(response['body'].read())
+            content = response_body['content'][0]['text']
+            
+            # Extract JSON from response
+            import json
+            metadata = json.loads(content)
+            
+            return {
+                'llm_extracted': metadata
+            }
+            
+        except Exception as e:
+            print(f"Bedrock analysis failed: {e}")
+            return {'llm_extracted': {}}
+    
+    def _custom_patterns(self, text: str) -> Dict:
+        """Extract using custom regex patterns."""
+        results = {}
+        
+        # Financial patterns
+        money_pattern = r'\$\d+(?:\.\d+)?[BMK]?'
+        money_matches = re.findall(money_pattern, text)
+        results['monetary_values'] = list(set(money_matches))[:10]
+        
+        # Percentage pattern
+        percent_pattern = r'\d+(?:\.\d+)?%'
+        percent_matches = re.findall(percent_pattern, text)
+        results['percentages'] = list(set(percent_matches))[:10]
+        
+        # Quarter pattern
+        quarter_pattern = r'Q[1-4]\s*\d{4}'
+        quarter_matches = re.findall(quarter_pattern, text)
+        results['quarters_mentioned'] = list(set(quarter_matches))
+        
+        # Year pattern
+        year_pattern = r'\b(19|20)\d{2}\b'
+        year_matches = re.findall(year_pattern, text)
+        results['years_mentioned'] = list(set(year_matches))
+        
+        # Financial metrics keywords
+        metrics_keywords = [
+            'revenue', 'profit', 'EBITDA', 'earnings', 'margin',
+            'growth', 'loss', 'cash flow', 'ROI', 'ROE', 'EPS'
+        ]
+        text_lower = text.lower()
+        results['financial_metrics_found'] = [
+            metric for metric in metrics_keywords 
+            if metric.lower() in text_lower
+        ]
+        
+        return results
+
+
+# Usage
+enricher = MetadataEnricher()
+
+# Enrich single chunk
+enriched_chunk = enricher.enrich_chunk(chunk, tier='standard')
+
+# Batch enrich all chunks
+enriched_chunks = [
+    enricher.enrich_chunk(chunk, tier='standard')
+    for chunk in chunks
+]
+```
+
+
+================================================================================
+8. COST COMPARISON
+================================================================================
+
+For 10,000 chunks (avg 500 chars each):
+
+┌──────────────────────────┬────────────┬──────────────────┐
+│ Approach                 │ Cost       │ Features         │
+├──────────────────────────┼────────────┼──────────────────┤
+│ Basic only               │ $0         │ Limited          │
+│ + Comprehend             │ ~$5        │ Good             │
+│ + Custom patterns        │ ~$5        │ Better           │
+│ + Bedrock (10%)          │ ~$15       │ Excellent        │
+│ + Bedrock (100%)         │ ~$100      │ Best (expensive) │
+│ Kendra managed service   │ ~$1000/mo  │ Fully managed    │
+└──────────────────────────┴────────────┴──────────────────┘
+
+Recommendation: **Comprehend + Custom patterns** = $5 for 10K chunks
+Best balance of cost/quality for most use cases.
+
+
+================================================================================
+9. FINAL RECOMMENDATIONS
+================================================================================
+
+FOR YOUR USE CASE (Financial Documents):
+─────────────────────────────────────────
+
+✅ DEFINITELY USE:
+1. AWS Comprehend - detect_entities()
+   - Get orgs, people, dates, quantities
+   
+2. AWS Comprehend - detect_key_phrases()
+   - Extract important phrases
+   
+3. Custom regex patterns
+   - Financial amounts: $XXX
+   - Percentages: XX%
+   - Quarters: Q1-Q4 YYYY
+   - Metrics: revenue, profit, etc.
+
+✅ CONSIDER USING:
+4. AWS Comprehend - detect_sentiment()
+   - If sentiment matters (analyst reports, news)
+   
+5. AWS Bedrock (selective)
+   - For high-value sections (exec summary, conclusions)
+   - Custom topic classification
+   - Financial metric extraction
+
+❌ PROBABLY SKIP:
+- AWS Kendra (expensive for your needs)
+- Comprehend Medical (not medical documents)
+- AWS Translate (if English only)
+
+
+IMPLEMENTATION PRIORITY:
+────────────────────────
+
+Phase 1: Basic + Custom Patterns (Week 1)
+  - Implement regex-based extraction
+  - Cost: $0
+  - Quick wins
+
+Phase 2: Add Comprehend NER + Key Phrases (Week 2)
+  - Integrate AWS Comprehend
+  - Cost: ~$5 per 10K chunks
+  - Major quality boost
+
+Phase 3: Add Bedrock for 10% of chunks (Week 3)
+  - Custom extraction for important sections
+  - Cost: ~$10 additional
+  - Targeted quality improvements
+
+Phase 4: Optimize based on RAG performance (Ongoing)
+  - Measure retrieval accuracy
+  - Tune what metadata helps most
+  - Add/remove features based on value
+
+
+================================================================================
+END OF METADATA ENRICHMENT GUIDE
+================================================================================
+
+Next steps:
+1. Start with Comprehend NER + custom patterns
+2. Measure RAG retrieval improvement
+3. Add advanced features based on value
+4. Monitor costs and optimize
+
+This metadata will dramatically improve your RAG system's ability to find
+and rank relevant chunks!
