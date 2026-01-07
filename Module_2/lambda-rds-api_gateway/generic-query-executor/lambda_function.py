@@ -23,10 +23,19 @@ Why this design?
 import json
 import os
 import boto3
+import logging
+import traceback
 from botocore.exceptions import ClientError
 import psycopg2
 from psycopg2 import pool
 from typing import Dict, Any, Optional
+
+# ---------------------------------------------------------
+# Logging Configuration
+# ---------------------------------------------------------
+
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
 
 # ---------------------------------------------------------
 # Global State (Reused Across Lambda Invocations)
@@ -37,7 +46,6 @@ connection_pool = None
 
 # Cached DB credentials to avoid repeated Secrets Manager calls
 cached_credentials = None
-
 
 # ---------------------------------------------------------
 # Secrets Manager Integration
@@ -70,7 +78,10 @@ def get_secret(secret_name: str) -> Dict[str, Any]:
 
     # Return cached credentials if already loaded
     if cached_credentials:
+        logger.info(f"Using cached credentials for secret: {secret_name}")
         return cached_credentials
+
+    logger.info(f"Fetching credentials from Secrets Manager, secret: {secret_name}, region: {os.environ.get('AWS_REGION', 'us-east-1')}")
 
     # Create Secrets Manager client
     session = boto3.session.Session()
@@ -81,10 +92,12 @@ def get_secret(secret_name: str) -> Dict[str, Any]:
 
     try:
         response = client.get_secret_value(SecretId=secret_name)
+        logger.info(f"Successfully retrieved secret: {secret_name}")
 
     except ClientError as e:
         # Explicit handling of Secrets Manager failure scenarios
         error_code = e.response["Error"]["Code"]
+        logger.error(f"Failed to retrieve secret: {secret_name}, error_code: {error_code}, error: {str(e)}, trace: {traceback.format_exc()}")
 
         if error_code == "DecryptionFailureException":
             raise Exception("Secrets Manager cannot decrypt the secret")
@@ -103,8 +116,10 @@ def get_secret(secret_name: str) -> Dict[str, Any]:
     if "SecretString" in response:
         secret = json.loads(response["SecretString"])
         cached_credentials = secret  # Cache for reuse
+        logger.info(f"Secret parsed and cached, secret: {secret_name}")
         return secret
 
+    logger.error(f"Unsupported secret format (binary), secret: {secret_name}")
     raise Exception("Unsupported secret format (binary secret)")
 
 
@@ -129,26 +144,51 @@ def get_db_connection():
     global connection_pool
 
     if connection_pool is None:
+        logger.info("Initializing database connection pool")
+
         # Secret name must be provided via environment variable
         secret_name = os.environ.get("DB_SECRET_NAME")
         if not secret_name:
+            logger.error("DB_SECRET_NAME environment variable not set")
             raise Exception("DB_SECRET_NAME environment variable is not set")
 
         # Fetch DB credentials securely
         credentials = get_secret(secret_name)
 
-        # Initialize PostgreSQL connection pool
-        connection_pool = psycopg2.pool.SimpleConnectionPool(
-            minconn=1,
-            maxconn=10,
-            host=credentials.get("host", os.environ.get("DB_HOST")),
-            database=credentials.get("dbname", "postgres"),
-            user=credentials.get("username", os.environ.get("DB_USER")),
-            password=credentials["password"],  # MUST come from secret
-            port=credentials.get("port", os.environ.get("DB_PORT", "5432"))
-        )
+        db_host = credentials.get("host", os.environ.get("DB_HOST"))
+        db_name = credentials.get("dbname", "postgres")
+        db_user = credentials.get("username", os.environ.get("DB_USER"))
+        db_port = credentials.get("port", os.environ.get("DB_PORT", "5432"))
 
-    return connection_pool.getconn()
+        logger.info(f"Creating connection pool, host: {db_host}, database: {db_name}, user: {db_user}, port: {db_port}")
+
+        try:
+            # Initialize PostgreSQL connection pool
+            connection_pool = psycopg2.pool.SimpleConnectionPool(
+                minconn=1,
+                maxconn=10,
+                host=db_host,
+                database=db_name,
+                user=db_user,
+                password=credentials["password"],  # MUST come from secret
+                port=db_port
+            )
+
+            logger.info(f"Connection pool created successfully, host: {db_host}, database: {db_name}")
+
+        except Exception as e:
+            logger.error(f"Failed to create connection pool, host: {db_host}, database: {db_name}, error: {str(e)}, type: {type(e).__name__}, trace: {traceback.format_exc()}")
+            raise
+
+    logger.info("Acquiring connection from pool")
+
+    try:
+        conn = connection_pool.getconn()
+        logger.info(f"Connection acquired successfully, connection_id: {id(conn)}")
+        return conn
+    except Exception as e:
+        logger.error(f"Failed to acquire connection from pool, error: {str(e)}, type: {type(e).__name__}, trace: {traceback.format_exc()}")
+        raise
 
 
 def return_db_connection(conn):
@@ -159,7 +199,9 @@ def return_db_connection(conn):
     prevents connection leaks.
     """
     global connection_pool
-    if connection_pool:
+
+    if connection_pool and conn:
+        logger.info(f"Returning connection to pool, connection_id: {id(conn)}")
         connection_pool.putconn(conn)
 
 
@@ -201,13 +243,19 @@ def execute_query(
     conn = None
     cursor = None
 
+    logger.info(f"Executing query: {query}, params: {params}, fetch: {fetch}")
+
     try:
         # Acquire DB connection
         conn = get_db_connection()
         cursor = conn.cursor()
 
+        logger.info(f"Executing SQL statement: {query}")
+
         # Execute parameterized query (prevents SQL injection)
         cursor.execute(query, params)
+
+        logger.info(f"SQL statement executed, query: {query}, rowcount: {cursor.rowcount}")
 
         result = {
             "success": True,
@@ -221,10 +269,14 @@ def execute_query(
 
             # Convert rows into list of dictionaries
             result["data"] = [dict(zip(columns, row)) for row in rows]
+
+            logger.info(f"Query results fetched, query: {query}, rowcount: {cursor.rowcount}, result_count: {len(result['data'])}, columns: {columns}")
         else:
-            # Commit transactional queries
-            conn.commit()
             result["data"] = None
+
+        # Always commit the transaction after successful execution
+        conn.commit()
+        logger.info(f"Transaction committed, query: {query}, rowcount: {cursor.rowcount}")
 
         return result
 
@@ -232,6 +284,9 @@ def execute_query(
         # Roll back transaction on DB errors
         if conn:
             conn.rollback()
+            logger.info(f"Transaction rolled back, query: {query}")
+
+        logger.error(f"Database error during query execution, query: {query}, params: {params}, error: {str(e)}, error_code: {getattr(e, 'pgcode', None)}, type: {type(e).__name__}, trace: {traceback.format_exc()}")
 
         return {
             "success": False,
@@ -242,6 +297,9 @@ def execute_query(
     except Exception as e:
         if conn:
             conn.rollback()
+            logger.info(f"Transaction rolled back, query: {query}")
+
+        logger.error(f"Unexpected error during query execution, query: {query}, params: {params}, error: {str(e)}, type: {type(e).__name__}, trace: {traceback.format_exc()}")
 
         return {
             "success": False,
@@ -251,6 +309,7 @@ def execute_query(
     finally:
         # Always clean up resources
         if cursor:
+            logger.info(f"Closing cursor for query: {query}")
             cursor.close()
         if conn:
             return_db_connection(conn)
@@ -281,16 +340,27 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     -------
     API Gateway–compatible HTTP response
     """
+
+    logger.info("Lambda invocation started")
+
     try:
         # Support both API Gateway and direct Lambda invocation
-        body = json.loads(event["body"]) if isinstance(event.get("body"), str) else event
+        if isinstance(event.get("body"), str):
+            logger.info("Parsing API Gateway request body")
+            body = json.loads(event["body"])
+        else:
+            logger.info("Using direct Lambda invocation payload")
+            body = event
 
         query = body.get("query")
         params = body.get("params")
         fetch = body.get("fetch", True)
 
+        logger.info(f"Request parsed, query: {query}, params: {params}, fetch: {fetch}")
+
         # Input validation
         if not query:
+            logger.warning("Query validation failed - query is required")
             return {
                 "statusCode": 400,
                 "headers": {
@@ -306,12 +376,17 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         # Convert params list to tuple for psycopg2
         if params and isinstance(params, list):
             params = tuple(params)
+            logger.info(f"Converted params list to tuple, param_count: {len(params)}")
 
         # Execute SQL query
         result = execute_query(query, params, fetch)
 
+        status_code = 200 if result["success"] else 500
+
+        logger.info(f"Lambda invocation completed, status_code: {status_code}, success: {result['success']}, rowcount: {result.get('rowcount')}")
+
         return {
-            "statusCode": 200 if result["success"] else 500,
+            "statusCode": status_code,
             "headers": {
                 "Content-Type": "application/json",
                 "Access-Control-Allow-Origin": "*"
@@ -320,6 +395,8 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         }
 
     except json.JSONDecodeError as e:
+        logger.error(f"JSON decode error, error: {str(e)}, type: {type(e).__name__}, trace: {traceback.format_exc()}")
+
         return {
             "statusCode": 400,
             "headers": {
@@ -333,6 +410,8 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         }
 
     except Exception as e:
+        logger.error(f"Unhandled exception in lambda_handler, error: {str(e)}, type: {type(e).__name__}, trace: {traceback.format_exc()}")
+
         return {
             "statusCode": 500,
             "headers": {
