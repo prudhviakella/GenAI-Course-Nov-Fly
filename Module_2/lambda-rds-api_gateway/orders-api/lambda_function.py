@@ -23,8 +23,17 @@ Why this design?
 import json
 import os
 import boto3
+import logging
+import traceback
 from typing import Dict, Any
-from datetime import datetime
+from datetime import datetime, UTC
+
+# ---------------------------------------------------------
+# Logging Configuration
+# ---------------------------------------------------------
+
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
 
 # ---------------------------------------------------------
 # AWS Clients
@@ -39,6 +48,8 @@ QUERY_EXECUTOR_FUNCTION = os.environ.get(
     "QUERY_EXECUTOR_FUNCTION",
     "generic-query-executor"
 )
+
+logger.info(f"Initialized with QUERY_EXECUTOR_FUNCTION: {QUERY_EXECUTOR_FUNCTION}")
 
 # ---------------------------------------------------------
 # Helper: Invoke Generic Query Executor
@@ -71,26 +82,45 @@ def invoke_query_executor(
         - error (optional)
     """
 
+    logger.info(f"Invoking query executor function: {QUERY_EXECUTOR_FUNCTION}, query: {query[:100]}, params: {len(params or [])}, fetch: {fetch}")
+
     payload = {
         "query": query,
         "params": params or [],
         "fetch": fetch
     }
 
-    # Synchronous invocation so caller waits for DB result
-    response = lambda_client.invoke(
-        FunctionName=QUERY_EXECUTOR_FUNCTION,
-        InvocationType="RequestResponse",
-        Payload=json.dumps(payload)
-    )
+    try:
+        # Synchronous invocation so caller waits for DB result
+        response = lambda_client.invoke(
+            FunctionName=QUERY_EXECUTOR_FUNCTION,
+            InvocationType="RequestResponse",
+            Payload=json.dumps(payload)
+        )
 
-    response_payload = json.loads(response["Payload"].read())
+        logger.info(f"Query executor invocation successful, status code: {response.get('StatusCode')}")
 
-    # Handle API Gateway-style responses
-    if isinstance(response_payload.get("body"), str):
-        return json.loads(response_payload["body"])
+        response_payload = json.loads(response["Payload"].read())
 
-    return response_payload
+        # Handle API Gateway-style responses
+        if isinstance(response_payload.get("body"), str):
+            result = json.loads(response_payload["body"])
+        else:
+            result = response_payload
+
+        if result.get("success"):
+            logger.info(f"Query executed successfully, rowcount: {result.get('rowcount')}, data_count: {len(result.get('data', []))}")
+        else:
+            logger.error(f"Query execution failed, error: {result.get('error')}")
+
+        return result
+
+    except Exception as e:
+        logger.error(f"Failed to invoke query executor: {QUERY_EXECUTOR_FUNCTION}, error: {str(e)}, type: {type(e).__name__}, trace: {traceback.format_exc()}")
+        return {
+            "success": False,
+            "error": f"Lambda invocation failed: {str(e)}"
+        }
 
 
 # ---------------------------------------------------------
@@ -120,10 +150,13 @@ def create_order(event_body: Dict[str, Any]) -> Dict[str, Any]:
     - status defaults to 'pending' if not provided
     """
 
+    logger.info(f"Creating new order, order_id: {event_body.get('order_id')}, customer_id: {event_body.get('customer_id')}, total_amount: {event_body.get('total_amount')}")
+
     # Validate required fields
     required_fields = ["order_id", "customer_id", "total_amount"]
     for field in required_fields:
         if field not in event_body:
+            logger.warning(f"Missing required field: {field}")
             return {
                 "statusCode": 400,
                 "body": json.dumps({
@@ -133,6 +166,8 @@ def create_order(event_body: Dict[str, Any]) -> Dict[str, Any]:
             }
 
     # Ensure referenced customer exists (FK-style validation)
+    logger.info(f"Validating customer exists, customer_id: {event_body['customer_id']}")
+
     check_query = """
     SELECT customer_id
     FROM demo.customers
@@ -146,6 +181,7 @@ def create_order(event_body: Dict[str, Any]) -> Dict[str, Any]:
     )
 
     if not check_result.get("success") or not check_result.get("data"):
+        logger.warning(f"Customer does not exist, customer_id: {event_body['customer_id']}")
         return {
             "statusCode": 400,
             "body": json.dumps({
@@ -154,25 +190,29 @@ def create_order(event_body: Dict[str, Any]) -> Dict[str, Any]:
             })
         }
 
-    # Insert new order
+    logger.info(f"Customer validation successful, customer_id: {event_body['customer_id']}")
+
+    # Insert new order - let PostgreSQL handle the timestamp
     query = """
     INSERT INTO demo.orders
     (order_id, customer_id, order_date, status, total_amount)
-    VALUES (%s, %s, %s, %s, %s)
+    VALUES (%s, %s, CURRENT_TIMESTAMP, %s, %s)
     RETURNING order_id, customer_id, order_date, status, total_amount
     """
 
     params = [
         event_body["order_id"],
         event_body["customer_id"],
-        datetime.utcnow(),                       # Order creation timestamp
         event_body.get("status", "pending"),     # Default order status
         event_body["total_amount"]
     ]
 
+    logger.info(f"Executing order insert, order_id: {event_body['order_id']}, status: {event_body.get('status', 'pending')}")
+
     result = invoke_query_executor(query, params, fetch=True)
 
     if result.get("success"):
+        logger.info(f"Order created successfully, order_id: {event_body['order_id']}")
         return {
             "statusCode": 201,
             "body": json.dumps({
@@ -182,6 +222,7 @@ def create_order(event_body: Dict[str, Any]) -> Dict[str, Any]:
             }, default=str)
         }
 
+    logger.error(f"Failed to create order, order_id: {event_body['order_id']}, error: {result.get('error')}")
     return {
         "statusCode": 500,
         "body": json.dumps({
@@ -205,6 +246,12 @@ def get_orders(query_params: Dict[str, Any]) -> Dict[str, Any]:
     GET /orders?order_id=ORD001
     GET /orders?customer_id=CUST001
 
+    Query Parameters
+    ----------------
+    - order_id: Fetch specific order
+    - customer_id: Fetch all orders for a customer
+    - (no parameters): Fetch all orders
+
     Behavior
     --------
     - order_id → fetch specific order
@@ -214,6 +261,8 @@ def get_orders(query_params: Dict[str, Any]) -> Dict[str, Any]:
 
     order_id = query_params.get("order_id")
     customer_id = query_params.get("customer_id")
+
+    logger.info(f"Fetching orders, order_id: {order_id}, customer_id: {customer_id}")
 
     if order_id:
         query = """
@@ -246,10 +295,13 @@ def get_orders(query_params: Dict[str, Any]) -> Dict[str, Any]:
         """
         params = []
 
+    logger.info(f"Executing query: {query}")
+
     result = invoke_query_executor(query, params, fetch=True)
 
     if result.get("success"):
         data = result.get("data", [])
+        logger.info(f"Orders fetched successfully, order_id: {order_id}, customer_id: {customer_id}, count: {len(data)}")
         return {
             "statusCode": 200,
             "body": json.dumps({
@@ -259,6 +311,7 @@ def get_orders(query_params: Dict[str, Any]) -> Dict[str, Any]:
             }, default=str)
         }
 
+    logger.error(f"Failed to fetch orders, order_id: {order_id}, customer_id: {customer_id}, error: {result.get('error')}")
     return {
         "statusCode": 500,
         "body": json.dumps({
@@ -278,7 +331,11 @@ def update_order(order_id: str, event_body: Dict[str, Any]) -> Dict[str, Any]:
 
     Endpoint
     --------
-    PUT /orders/{order_id}
+    PUT /orders?order_id=ORD001
+
+    Query Parameters
+    ----------------
+    - order_id: Required - ID of the order to update
 
     Updatable Fields
     ----------------
@@ -286,7 +343,10 @@ def update_order(order_id: str, event_body: Dict[str, Any]) -> Dict[str, Any]:
     - total_amount
     """
 
+    logger.info(f"Updating order, order_id: {order_id}, fields: {list(event_body.keys())}")
+
     if not order_id:
+        logger.warning("Update attempted without order_id")
         return {
             "statusCode": 400,
             "body": json.dumps({
@@ -308,6 +368,7 @@ def update_order(order_id: str, event_body: Dict[str, Any]) -> Dict[str, Any]:
         params.append(event_body["total_amount"])
 
     if not update_fields:
+        logger.warning(f"No fields to update for order_id: {order_id}")
         return {
             "statusCode": 400,
             "body": json.dumps({
@@ -326,10 +387,13 @@ def update_order(order_id: str, event_body: Dict[str, Any]) -> Dict[str, Any]:
     RETURNING order_id, customer_id, order_date, status, total_amount
     """
 
+    logger.info(f"Executing update query: {query}, params: {params}")
+
     result = invoke_query_executor(query, params, fetch=True)
 
     if result.get("success"):
         if result.get("rowcount", 0) == 0:
+            logger.warning(f"Order not found for update, order_id: {order_id}")
             return {
                 "statusCode": 404,
                 "body": json.dumps({
@@ -338,6 +402,7 @@ def update_order(order_id: str, event_body: Dict[str, Any]) -> Dict[str, Any]:
                 })
             }
 
+        logger.info(f"Order updated successfully, order_id: {order_id}")
         return {
             "statusCode": 200,
             "body": json.dumps({
@@ -347,6 +412,7 @@ def update_order(order_id: str, event_body: Dict[str, Any]) -> Dict[str, Any]:
             }, default=str)
         }
 
+    logger.error(f"Failed to update order, order_id: {order_id}, error: {result.get('error')}")
     return {
         "statusCode": 500,
         "body": json.dumps({
@@ -366,10 +432,17 @@ def delete_order(order_id: str) -> Dict[str, Any]:
 
     Endpoint
     --------
-    DELETE /orders/{order_id}
+    DELETE /orders?order_id=ORD001
+
+    Query Parameters
+    ----------------
+    - order_id: Required - ID of the order to delete
     """
 
+    logger.info(f"Deleting order, order_id: {order_id}")
+
     if not order_id:
+        logger.warning("Delete attempted without order_id")
         return {
             "statusCode": 400,
             "body": json.dumps({
@@ -383,10 +456,13 @@ def delete_order(order_id: str) -> Dict[str, Any]:
     WHERE order_id = %s
     """
 
+    logger.info(f"Executing delete query: {query}, order_id: {order_id}")
+
     result = invoke_query_executor(query, [order_id], fetch=False)
 
     if result.get("success"):
         if result.get("rowcount", 0) == 0:
+            logger.warning(f"Order not found for deletion, order_id: {order_id}")
             return {
                 "statusCode": 404,
                 "body": json.dumps({
@@ -395,6 +471,7 @@ def delete_order(order_id: str) -> Dict[str, Any]:
                 })
             }
 
+        logger.info(f"Order deleted successfully, order_id: {order_id}")
         return {
             "statusCode": 200,
             "body": json.dumps({
@@ -403,6 +480,7 @@ def delete_order(order_id: str) -> Dict[str, Any]:
             })
         }
 
+    logger.error(f"Failed to delete order, order_id: {order_id}, error: {result.get('error')}")
     return {
         "statusCode": 500,
         "body": json.dumps({
@@ -428,6 +506,8 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     - Handle unexpected failures safely
     """
 
+    logger.info("Lambda invocation started")
+
     try:
         http_method = event.get(
             "httpMethod",
@@ -437,25 +517,45 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         path_parameters = event.get("pathParameters") or {}
         query_parameters = event.get("queryStringParameters") or {}
 
+        logger.info(f"Request received, method: {http_method}, path: {event.get('path')}, query_params: {query_parameters}, path_params: {path_parameters}")
+
         body = {}
         if event.get("body"):
-            body = json.loads(event["body"]) if isinstance(event["body"], str) else event["body"]
+            try:
+                body = json.loads(event["body"]) if isinstance(event["body"], str) else event["body"]
+                logger.info(f"Request body parsed, keys: {list(body.keys())}")
+            except json.JSONDecodeError as e:
+                logger.error(f"Invalid JSON in request body, error: {str(e)}")
+                return {
+                    "statusCode": 400,
+                    "headers": {
+                        "Content-Type": "application/json",
+                        "Access-Control-Allow-Origin": "*"
+                    },
+                    "body": json.dumps({
+                        "success": False,
+                        "error": "Invalid JSON in request body"
+                    })
+                }
 
         # Route request
+        logger.info(f"Routing request, method: {http_method}")
+
         if http_method == "POST":
             response = create_order(body)
         elif http_method == "GET":
             response = get_orders(query_parameters)
         elif http_method == "PUT":
             response = update_order(
-                path_parameters.get("order_id") or path_parameters.get("id"),
+                query_parameters.get("order_id") or query_parameters.get("id"),
                 body
             )
         elif http_method == "DELETE":
             response = delete_order(
-                path_parameters.get("order_id") or path_parameters.get("id")
+                query_parameters.get("order_id") or query_parameters.get("id")
             )
         else:
+            logger.warning(f"Unsupported HTTP method: {http_method}")
             response = {
                 "statusCode": 405,
                 "body": json.dumps({
@@ -473,9 +573,13 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             "Access-Control-Allow-Headers": "Content-Type"
         })
 
+        logger.info(f"Lambda invocation completed, status_code: {response.get('statusCode')}")
+
         return response
 
     except Exception as e:
+        logger.error(f"Unhandled exception in lambda_handler, error: {str(e)}, type: {type(e).__name__}, trace: {traceback.format_exc()}")
+
         return {
             "statusCode": 500,
             "headers": {
