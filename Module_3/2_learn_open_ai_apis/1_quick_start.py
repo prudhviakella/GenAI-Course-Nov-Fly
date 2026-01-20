@@ -65,7 +65,7 @@ if __name__ == "__main__":
     # Example 1: Simple question
     print("\nExample 1: Simple Question")
     print("-" * 70)
-    response = ask_ai("What is machine learning? Explain in 2 sentences.")
+    response = ask_ai("What is machine learning? Explain in 2 sentences.",model='gpt-5')
     print(response)
     
     # # Example 2: Classification

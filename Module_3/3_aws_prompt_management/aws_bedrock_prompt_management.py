@@ -370,6 +370,7 @@ class BedrockPromptManager:
                 params["promptVersion"] = version
 
             prompt_response = self.bedrock_agent.get_prompt(**params)
+            print("get_prompt response", prompt_response)
 
             # Extract configuration
             variant = prompt_response['variants'][0]
@@ -418,7 +419,7 @@ class BedrockPromptManager:
             )
 
             response_body = json.loads(response['body'].read())
-
+            print("invoke_model response", response_body)
             # Extract text based on model type
             if 'anthropic' in model_id.lower():
                 # Claude response format
@@ -713,7 +714,7 @@ def example_1_create_and_use():
         variables=["customer_name", "product_name"],
         model_id="us.amazon.nova-lite-v1:0"  # Amazon Nova - No subscription needed
     )
-
+    print("create_prompt response",result)
     if result['success']:
         print(f"✓ Created: {result['prompt_name']}")
         print(f"  Bedrock ID: {result['prompt_id']}")
@@ -893,14 +894,14 @@ if __name__ == "__main__":
 
         try:
             example_1_create_and_use()
-            print("\n" + "-"*80)
+            # print("\n" + "-"*80)
             example_2_list_and_details()
-            print("\n" + "-"*80)
-            example_3_versioning()
-
-            print("\n" + "="*80)
-            print("All examples completed")
-            print("="*80)
+            # print("\n" + "-"*80)
+            # example_3_versioning()
+            #
+            # print("\n" + "="*80)
+            # print("All examples completed")
+            # print("="*80)
         except Exception as e:
             print(f"\n\nError: {str(e)}")
     else:

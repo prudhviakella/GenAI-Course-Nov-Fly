@@ -691,7 +691,7 @@ def example_5_streaming():
     print("-"*80)
 
     for chunk in executor.execute_streaming(prompt):
-        print(chunk, end="", flush=True)
+        print(chunk,end='')
 
     print("\n")
 
@@ -876,7 +876,7 @@ def main():
         example_2_system_prompt()
         example_3_json_output()
         example_4_conversation()
-        example_5_streaming()
+        # example_5_streaming()
         example_6_classification()
         example_7_costar()
         example_8_batch_processing()
