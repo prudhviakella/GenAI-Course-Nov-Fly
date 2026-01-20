@@ -894,14 +894,14 @@ if __name__ == "__main__":
 
         try:
             example_1_create_and_use()
-            # print("\n" + "-"*80)
+            print("\n" + "-"*80)
             example_2_list_and_details()
-            # print("\n" + "-"*80)
-            # example_3_versioning()
+            print("\n" + "-"*80)
+            example_3_versioning()
             #
-            # print("\n" + "="*80)
-            # print("All examples completed")
-            # print("="*80)
+            print("\n" + "="*80)
+            print("All examples completed")
+            print("="*80)
         except Exception as e:
             print(f"\n\nError: {str(e)}")
     else:

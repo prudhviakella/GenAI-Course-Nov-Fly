@@ -776,7 +776,7 @@ async def get_technique_by_name(name: str):
 # ============================================================================
 
 # This block only runs when the file is executed directly (not imported)
-# Allows running the API with: python api.py
+# Allows running the API with: python fast_api_main.py
 if __name__ == "__main__":
     # Import uvicorn server
     import uvicorn

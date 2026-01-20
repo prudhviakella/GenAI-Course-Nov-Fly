@@ -72,7 +72,7 @@ This will analyze 4 example business problems and save detailed recommendations 
 Launch the interactive web app:
 
 ```bash
-streamlit run app.py
+streamlit run streamlit_app_main.py
 ```
 
 Then open your browser to `http://localhost:8501`
@@ -354,7 +354,7 @@ pip install -r requirements.txt --upgrade
 ### Streamlit Port Conflicts
 ```bash
 # Use different port
-streamlit run app.py --server.port 8502
+streamlit run streamlit_app_main.py --server.port 8502
 ```
 
 ## 🔮 Future Enhancements
