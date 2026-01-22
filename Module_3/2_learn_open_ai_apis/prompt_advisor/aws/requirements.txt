@@ -1,0 +1,6 @@
+fastapi
+pydantic
+pydantic-settings
+pydantic_core
+openai
+uvicorn
