@@ -127,58 +127,61 @@ class UnstructuredOpenAIVisionExtractor:
                 extract_images_in_pdf=True,  # Extract images
                 infer_table_structure=True  # Parse tables
             )
+            print(elements)
+            print(elements[0].to_dict())
+
             
-            print(f"✓ Extracted {len(elements)} elements\n")
-
-            # Step 2: Extract text
-            print("[2/5] Processing text elements...")
-            text_stats = self._extract_text(elements, doc_output_dir)
-            print(f"✓ Text: {text_stats['characters']:,} characters\n")
-
-            # Step 3: Extract tables
-            print("[3/5] Processing tables...")
-            tables_stats = self._extract_tables(elements, doc_output_dir)
-            print(f"✓ Tables: {tables_stats['count']}\n")
-
-            # Step 4: Extract figures
-            print("[4/5] Extracting figures...")
-            figures_stats = self._extract_figures(doc_path, elements, doc_output_dir)
-            print(f"✓ Figures: {figures_stats['count']}\n")
-
-            # Step 5: Generate descriptions with OpenAI Vision
-            print("[5/5] Generating figure descriptions with OpenAI Vision...")
-            descriptions_stats = self._generate_openai_descriptions(
-                figures_stats['files'], 
-                doc_output_dir
-            )
-            print(f"✓ Descriptions: {descriptions_stats['count']}\n")
-
-            # Save metadata
-            metadata = self._extract_metadata(doc_path, elements, doc_output_dir)
-
-            duration = (datetime.now() - start_time).total_seconds()
-
-            results = {
-                'success': True,
-                'document_file': str(doc_path),
-                'output_directory': str(doc_output_dir),
-                'duration_seconds': duration,
-                'vision_model': self.openai_model,
-                'extractor': 'Unstructured + OpenAI Vision',
-                'statistics': {
-                    'elements': len(elements),
-                    'text': text_stats,
-                    'tables': tables_stats,
-                    'figures': figures_stats,
-                    'descriptions': descriptions_stats
-                }
-            }
-
-            self._save_summary(results, doc_output_dir)
-            self._print_summary(results)
-
-            return results
-
+        #     print(f"✓ Extracted {len(elements)} elements\n")
+        #
+        #     # Step 2: Extract text
+        #     print("[2/5] Processing text elements...")
+        #     text_stats = self._extract_text(elements, doc_output_dir)
+        #     print(f"✓ Text: {text_stats['characters']:,} characters\n")
+        #
+        #     # Step 3: Extract tables
+        #     print("[3/5] Processing tables...")
+        #     tables_stats = self._extract_tables(elements, doc_output_dir)
+        #     print(f"✓ Tables: {tables_stats['count']}\n")
+        #
+        #     # Step 4: Extract figures
+        #     print("[4/5] Extracting figures...")
+        #     figures_stats = self._extract_figures(doc_path, elements, doc_output_dir)
+        #     print(f"✓ Figures: {figures_stats['count']}\n")
+        #
+        #     # Step 5: Generate descriptions with OpenAI Vision
+        #     print("[5/5] Generating figure descriptions with OpenAI Vision...")
+        #     descriptions_stats = self._generate_openai_descriptions(
+        #         figures_stats['files'],
+        #         doc_output_dir
+        #     )
+        #     print(f"✓ Descriptions: {descriptions_stats['count']}\n")
+        #
+        #     # Save metadata
+        #     metadata = self._extract_metadata(doc_path, elements, doc_output_dir)
+        #
+        #     duration = (datetime.now() - start_time).total_seconds()
+        #
+        #     results = {
+        #         'success': True,
+        #         'document_file': str(doc_path),
+        #         'output_directory': str(doc_output_dir),
+        #         'duration_seconds': duration,
+        #         'vision_model': self.openai_model,
+        #         'extractor': 'Unstructured + OpenAI Vision',
+        #         'statistics': {
+        #             'elements': len(elements),
+        #             'text': text_stats,
+        #             'tables': tables_stats,
+        #             'figures': figures_stats,
+        #             'descriptions': descriptions_stats
+        #         }
+        #     }
+        #
+        #     self._save_summary(results, doc_output_dir)
+        #     self._print_summary(results)
+        #
+        #     return results
+        #
         except Exception as e:
             print(f"\n✗ Failed: {e}")
             import traceback
