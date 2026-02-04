@@ -131,17 +131,17 @@ class UnstructuredOpenAIVisionExtractor:
             print(elements[0].to_dict())
 
             
-        #     print(f"✓ Extracted {len(elements)} elements\n")
+            print(f"✓ Extracted {len(elements)} elements\n")
+
+            # Step 2: Extract text
+            print("[2/5] Processing text elements...")
+            text_stats = self._extract_text(elements, doc_output_dir)
+            print(f"✓ Text: {text_stats['characters']:,} characters\n")
         #
-        #     # Step 2: Extract text
-        #     print("[2/5] Processing text elements...")
-        #     text_stats = self._extract_text(elements, doc_output_dir)
-        #     print(f"✓ Text: {text_stats['characters']:,} characters\n")
-        #
-        #     # Step 3: Extract tables
-        #     print("[3/5] Processing tables...")
-        #     tables_stats = self._extract_tables(elements, doc_output_dir)
-        #     print(f"✓ Tables: {tables_stats['count']}\n")
+            # Step 3: Extract tables
+            print("[3/5] Processing tables...")
+            tables_stats = self._extract_tables(elements, doc_output_dir)
+            print(f"✓ Tables: {tables_stats['count']}\n")
         #
         #     # Step 4: Extract figures
         #     print("[4/5] Extracting figures...")
