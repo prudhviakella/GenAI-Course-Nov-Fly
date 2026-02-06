@@ -1195,7 +1195,7 @@ class DoclingSmartV2:
 
                     # If no image was extracted but we have table text, output it
                     if not img_saved and md_table:
-                        page_lines.append(f"\n{md_table}\n")
+                        page_lines.append(f"$$$$$\n{md_table}\n$$$$$\n")
                         page_tables.append("Text Table")
 
             # ============================================================
@@ -1478,9 +1478,9 @@ class DoclingSmartV2:
                 # Format as blockquote for visual distinction
                 # Include image, relative path, and AI description
                 lines.append(
-                    f"\n> **{type_label}**\n"
+                    f"\n>$$$$$\n **{type_label}**\n"
                     f"> ![{fname}](../figures/{fname})\n"
-                    f"> *AI Analysis:* {desc}\n"
+                    f"> *AI Analysis:* {desc}\n$$$$$\n"
                 )
 
                 return True

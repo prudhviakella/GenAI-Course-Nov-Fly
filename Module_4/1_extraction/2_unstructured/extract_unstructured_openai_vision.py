@@ -143,18 +143,18 @@ class UnstructuredOpenAIVisionExtractor:
             tables_stats = self._extract_tables(elements, doc_output_dir)
             print(f"✓ Tables: {tables_stats['count']}\n")
         #
-        #     # Step 4: Extract figures
-        #     print("[4/5] Extracting figures...")
-        #     figures_stats = self._extract_figures(doc_path, elements, doc_output_dir)
-        #     print(f"✓ Figures: {figures_stats['count']}\n")
-        #
-        #     # Step 5: Generate descriptions with OpenAI Vision
-        #     print("[5/5] Generating figure descriptions with OpenAI Vision...")
-        #     descriptions_stats = self._generate_openai_descriptions(
-        #         figures_stats['files'],
-        #         doc_output_dir
-        #     )
-        #     print(f"✓ Descriptions: {descriptions_stats['count']}\n")
+            # Step 4: Extract figures
+            print("[4/5] Extracting figures...")
+            figures_stats = self._extract_figures(doc_path, elements, doc_output_dir)
+            print(f"✓ Figures: {figures_stats['count']}\n")
+
+            # Step 5: Generate descriptions with OpenAI Vision
+            print("[5/5] Generating figure descriptions with OpenAI Vision...")
+            descriptions_stats = self._generate_openai_descriptions(
+                figures_stats['files'],
+                doc_output_dir
+            )
+            print(f"✓ Descriptions: {descriptions_stats['count']}\n")
         #
         #     # Save metadata
         #     metadata = self._extract_metadata(doc_path, elements, doc_output_dir)

@@ -1,0 +1,251 @@
+SEMANTIC CHUNKER - FUNCTIONAL MODULAR ARCHITECTURE
+===================================================
+
+MODULE DEPENDENCY MAP
+---------------------
+
+main.py (Entry Point)
+  └─→ orchestrator.py (Pipeline Coordinator)
+        ├─→ config.py (Configuration)
+        │     └─→ [No dependencies]
+        │
+        ├─→ logger_utils.py (Logging)
+        │     └─→ [No dependencies]
+        │
+        ├─→ file_io.py (File Operations)
+        │     └─→ [No dependencies]
+        │
+        ├─→ protected_blocks.py (Block Detection)
+        │     └─→ config.py
+        │
+        ├─→ semantic_parser.py (Structure Parsing)
+        │     ├─→ config.py
+        │     └─→ protected_blocks.py
+        │
+        ├─→ chunking_engine.py (Chunk Building)
+        │     └─→ config.py
+        │
+        ├─→ continuation_detection.py (Continuation Detection)
+        │     └─→ config.py
+        │
+        ├─→ page_merging.py (Boundary Merging)
+        │     └─→ chunking_engine.py
+        │
+        └─→ statistics_calculator.py (Metrics)
+              └─→ [No dependencies]
+
+
+FILE SIZES & LINE COUNTS
+-------------------------
+
+File                          Size    Lines  Purpose
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+config.py                     9.3 KB   280   Configuration & constants
+logger_utils.py              11.9 KB   380   Logging utilities
+protected_blocks.py          14.4 KB   450   Atomic block detection
+semantic_parser.py           15.4 KB   480   Document parsing
+chunking_engine.py           17.1 KB   520   Chunk creation
+continuation_detection.py    11.8 KB   370   Cross-page analysis
+page_merging.py               2.9 KB    90   Boundary merging
+statistics_calculator.py      3.8 KB   120   Metrics computation
+file_io.py                    2.6 KB    80   File operations
+orchestrator.py              12.8 KB   400   Pipeline coordination
+main.py                       4.3 KB   130   CLI entry point
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+TOTAL                       106.3 KB  3,300  11 focused modules
+
+
+COMPLEXITY METRICS
+------------------
+
+Cyclomatic Complexity: LOW (avg 3-5 per function)
+Coupling: LOW (clear dependencies, no circular)
+Cohesion: HIGH (each module has single purpose)
+Testability: HIGH (pure functions, explicit state)
+
+
+KEY FUNCTIONS BY MODULE
+------------------------
+
+config.py
+  • create_config()         - Build validated config dict
+  • create_stats_dict()     - Initialize statistics
+  • config_to_string()      - Format config for logging
+
+logger_utils.py
+  • setup_logger()          - Create dual-output logger
+  • log_section_header()    - Pretty section headers
+  • log_progress()          - Progress reporting
+  • LogTimer (class)        - Context manager for timing
+
+protected_blocks.py
+  • identify_protected_blocks()        - Find all atomic blocks
+  • get_block_at_position()            - Check cursor position
+  • count_protected_blocks_by_type()   - Statistics
+  • validate_protected_blocks()        - Ensure well-formed
+
+semantic_parser.py
+  • parse_semantic_sections()    - Parse markdown to sections
+  • consolidate_paragraphs()     - Group paragraphs
+  • analyze_sections()           - Section statistics
+
+chunking_engine.py
+  • build_chunks_from_sections()  - Main chunking logic
+  • smart_split()                 - Sentence-boundary splitting
+  • create_chunk()                - Build chunk with metadata
+  • validate_chunk()              - Ensure well-formed
+  • add_chunk_with_dedup()        - Add with dedup check
+
+continuation_detection.py
+  • detect_page_continuation()           - Main detection
+  • _check_conjunction_ending()          - Conjunction signal
+  • _check_terminal_punctuation()        - Punctuation signal
+  • _check_numbered_list_continuation()  - List signal
+  • _check_table_continuation()          - Table signal
+
+page_merging.py
+  • merge_continued_pages()  - Merge boundary chunks
+
+statistics_calculator.py
+  • calculate_comprehensive_statistics()  - Full metrics
+
+file_io.py
+  • load_metadata()          - Load metadata.json
+  • save_chunks_output()     - Save chunks + stats
+
+orchestrator.py
+  • process_document()       - Main processing pipeline
+  • _process_single_page()   - Process one page
+  • _log_processing_summary() - Final summary
+
+main.py
+  • main()                   - CLI entry point
+
+
+DATA STRUCTURES
+---------------
+
+Config Dictionary
+  target_size: int
+  min_size: int
+  max_size: int
+  enable_merging: bool
+  patterns: Dict[str, Pattern]
+  image_patterns: List[str]
+  table_pattern: str
+  code_pattern: str
+
+Stats Dictionary
+  total_pages: int
+  total_chunks: int
+  merged_boundaries: int
+  duplicates_prevented: int
+  validation_failures: int
+  protected_blocks: Dict[str, int]
+  continuation_signals: List[str]
+
+Chunk Dictionary
+  id: str (MD5 hash)
+  text: str (with context)
+  content_only: str (without context)
+  metadata: Dict
+    source: str
+    page_number: int
+    type: str
+    breadcrumbs: List[str]
+    hierarchical_context: Dict
+    quality_metrics: Dict
+    ...
+
+
+PROCESSING FLOW
+----------------
+
+1. main.py: Parse CLI args
+2. orchestrator.py: Initialize config, logger, stats
+3. file_io.py: Load metadata.json
+4. FOR EACH PAGE:
+   a. file_io.py: Load page markdown
+   b. protected_blocks.py: Find atomic blocks
+   c. semantic_parser.py: Parse to sections
+   d. semantic_parser.py: Consolidate paragraphs
+   e. chunking_engine.py: Build chunks
+5. continuation_detection.py: Check for continuation
+6. page_merging.py: Merge if needed
+7. statistics_calculator.py: Calculate metrics
+8. file_io.py: Save output
+9. orchestrator.py: Log summary
+
+
+ERROR HANDLING LAYERS
+----------------------
+
+Layer 1 (main.py)
+  • KeyboardInterrupt → Graceful exit
+  • Exception → Log and exit with code 1
+
+Layer 2 (orchestrator.py)
+  • Validation errors → Log and return {}
+  • File errors → Log and continue
+
+Layer 3 (Module functions)
+  • Invalid input → Log warning, skip
+  • Critical error → Raise to orchestrator
+
+
+TESTING STRATEGY
+-----------------
+
+Unit Tests
+  • Test each function independently
+  • Mock dependencies (logger, config)
+  • Test edge cases and error conditions
+
+Integration Tests
+  • Test full pipeline
+  • Verify output format
+  • Check statistics accuracy
+
+Property Tests
+  • Chunk sizes within limits
+  • No duplicates in output
+  • Breadcrumbs maintain hierarchy
+
+
+EXTENSION POINTS
+----------------
+
+Add New Chunk Type
+  → protected_blocks.py: Add pattern
+  → chunking_engine.py: Handle new type
+  → statistics_calculator.py: Track new type
+
+Add New Continuation Signal
+  → continuation_detection.py: Add check function
+  → Update detect_page_continuation()
+
+Add New Metric
+  → statistics_calculator.py: Add calculation
+  → file_io.py: Include in output
+
+Add New Configuration
+  → config.py: Add to create_config()
+  → Use throughout pipeline
+
+
+COMPARISON: OOP vs FUNCTIONAL
+------------------------------
+
+Metric                  OOP            Functional
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Files                   1              11
+Lines per file          3,500          100-500
+Hidden state            Yes            No
+Testability             Hard           Easy
+Coupling                Tight          Loose
+Maintainability         Poor           Excellent
+Extensibility           Difficult      Simple
+Understanding           Complex        Clear
+Documentation           Minimal        Extensive
+Separation of Concerns  No             Yes
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
