@@ -305,16 +305,7 @@ def get_block_at_position(
     -------
     Tuple[int, int, str, str] | None
         The block at this position, or None if no block starts here
-    
-    Example
-    -------
-    >>> blocks = [(100, 200, 'image', '...'), (300, 400, 'table', '...')]
-    >>> get_block_at_position(blocks, 100)
-    (100, 200, 'image', '...')  # Found!
-    >>> get_block_at_position(blocks, 150)
-    None  # Inside block, but not at start
-    >>> get_block_at_position(blocks, 300)
-    (300, 400, 'table', '...')  # Found!
+
     """
     
     for block in blocks:

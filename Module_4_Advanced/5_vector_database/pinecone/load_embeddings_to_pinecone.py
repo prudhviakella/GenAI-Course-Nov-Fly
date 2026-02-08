@@ -395,7 +395,7 @@ Examples:
         """
     )
 
-    # /Users/akellaprudhvi/mystuff/Course/GenAI-Course-Modules/Module_4/1_extraction/1_llama_parse/extracted_docs_ultimate/AI-Enablers-Adopters-research-report/large_chunks_production_enriched_metadata_sentence_transformers_embeddings.json --dimensions 384
+    # /Users/akellaprudhvi/mystuff/Course/GenAI-Course-Modules/Module_4_Advanced/1_extraction/1_llama_parse/extracted_docs_ultimate/AI-Enablers-Adopters-research-report/large_chunks_production_enriched_metadata_sentence_transformers_embeddings.json --dimensions 384
 
     parser.add_argument('json_file', help='Path to JSON file with embeddings')
     parser.add_argument('--api-key', help='Pinecone API key (or use PINECONE_API_KEY env var)')

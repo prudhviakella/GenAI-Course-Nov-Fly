@@ -461,8 +461,7 @@ def main():
 
     # Input PDF path
     pdf_path = Path(
-        "/Users/akellaprudhvi/mystuff/Course/GenAI-Course-Modules/"
-        "Module_4/1_extraction/docs/AI-Enablers-Adopters-research-report.pdf"
+        "/Module_4_Advanced/1_extraction/docs/AI-Enablers-Adopters-research-report.pdf"
     )
 
     # Docling pipeline configuration

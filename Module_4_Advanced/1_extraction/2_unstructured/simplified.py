@@ -103,8 +103,7 @@ def _create_output_structure(doc_path: Path, custom_output: Path) -> Path:
 
 # Input document path
 doc_path = Path(
-    "/Users/akellaprudhvi/mystuff/Course/GenAI-Course-Modules/"
-    "Module_4/1_extraction/docs/AI-Enablers-Adopters-research-report.pdf"
+    "/Module_4_Advanced/1_extraction/docs/AI-Enablers-Adopters-research-report.pdf"
 )
 
 # Base output directory for all extractions

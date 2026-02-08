@@ -310,22 +310,22 @@ def _process_single_page(
     
     # Identify protected blocks
     protected_blocks = identify_protected_blocks(text, config, logger)
-    
+
     # # Update statistics
-    # block_counts = count_protected_blocks_by_type(protected_blocks)
-    # for block_type, count in block_counts.items():
-    #     stats['protected_blocks'][block_type] += count
+    block_counts = count_protected_blocks_by_type(protected_blocks)
+    for block_type, count in block_counts.items():
+        stats['protected_blocks'][block_type] += count
     #
     # # Parse semantic sections
-    # sections = parse_semantic_sections(text, protected_blocks, config, logger)
+    sections = parse_semantic_sections(text, protected_blocks, config, logger)
     #
-    # # Consolidate paragraphs
-    # sections = consolidate_paragraphs(sections, config, logger)
-    #
-    # # Build chunks
-    # chunks = build_chunks_from_sections(sections, page_meta, config, stats, logger)
-    #
-    # return chunks
+    # Consolidate paragraphs
+    sections = consolidate_paragraphs(sections, config, logger)
+
+    # Build chunks
+    chunks = build_chunks_from_sections(sections, page_meta, config, stats, logger)
+
+    return chunks
 
 
 # ============================================================================
