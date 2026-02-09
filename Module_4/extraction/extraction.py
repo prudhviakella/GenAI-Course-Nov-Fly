@@ -228,22 +228,17 @@ def process_list(item: ListItem, page: int, breadcrumbs: List[str]) -> str:
 
 
 def process_special_text(item: TextItem, page: int, breadcrumbs: List[str]) -> Optional[str]:
-    """Detect and process code blocks and formulas from TextItem"""
+    """Detect and process code blocks from TextItem (formula detection disabled)"""
     text = item.text.strip()
     if len(text) < 3:
         return None
 
+    # Only detect code blocks (formulas cause too many false positives)
     is_code = (
         text.startswith('    ') or text.startswith('\t') or '```' in text or
         text.count('def ') > 0 or text.count('class ') > 0 or
         text.count('import ') > 0 or text.count('function ') > 0 or
         ('{' in text and '}' in text and ';' in text)
-    )
-
-    is_formula = (
-        '$' in text or '∫' in text or '∑' in text or '√' in text or
-        'π' in text or '∞' in text or '≈' in text or '≤' in text or '≥' in text or
-        (('=' in text or '≡' in text) and any(c.isdigit() for c in text) and len(text) < 200)
     )
 
     if is_code:
@@ -261,13 +256,8 @@ def process_special_text(item: TextItem, page: int, breadcrumbs: List[str]) -> O
             breadcrumbs=" > ".join(breadcrumbs)
         )
 
-    elif is_formula:
-        content = f"$${text}$$" if '\n' in text else f"${text}$"
-        item_id = generate_unique_id(page, "formula")
-        return wrap_with_boundaries(
-            content, "formula", item_id, page,
-            breadcrumbs=" > ".join(breadcrumbs)
-        )
+    # Formula detection disabled - causes too many false positives
+    # If you need formula detection, use LaTeX delimiters: $..$ or $$..$$
 
     return None
 
