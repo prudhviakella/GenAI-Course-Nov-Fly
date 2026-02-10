@@ -30,18 +30,21 @@ AI's Rate of Change Has Driven Outperformance: Exhibit 1  shows the 2H24 outperf
 **Image**
 *Caption:* Exhibit 1 : Stock returns where both materiality and exposure were increased
 ![fig_p1_1.png](../figures/fig_p1_1.png)
-*AI Analysis:* This is a line chart.
+*AI Analysis:* This is a line chart comparing stock returns.
 
 **Axes:**
-- The x-axis represents time from December 2023 to November 2024.
-- The y-axis represents stock returns, indexed to 100.
+- **X-axis:** Time (from December 2023 to November 2024) in monthly intervals.
+- **Y-axis:** Indexed stock returns, starting at 100 and ranging from 95 to 135.
 
 **Trends:**
-- The "Stocks With Both AI Materiality & Exposure Increased" line (gold) shows consistent growth, especially from June onward, peaking in November.
-- The "MSCI World" line (blue) follows a steadier path with slight fluctuations and modest growth.
+- The chart compares two sets of stock returns: "MSCI World" (blue line) and "Stocks With Both AI Materiality & Exposure Increased" (gold line).
+- Initially, both lines start close to 100. 
+- The gold line begins to outpace the blue line significantly around May 2024.
+- The gold line shows a sharp increase from October 2024 onwards, reaching over 135 by November 2024.
+- The blue line (MSCI World) remains more stable, showing slight fluctuations but generally trending upwards moderately.
 
 **Key Insights:**
-- Stocks with AI focus show a significant upward trend compared to the MSCI World, reflecting stronger performance when both AI materiality and exposure are increased.
+- Stocks where AI materiality and exposure were increased (gold line) have experienced higher growth compared to the
 <!-- BOUNDARY_END type="image" id="p1_image_1" -->
 
 <!-- BOUNDARY_START type="paragraph" id="p1_text_5" page="1" char_count="127" word_count="19" breadcrumbs="Uncovering Alpha in AI's Rate of Change" -->
@@ -51,7 +54,7 @@ Source: Eikon, MS Research. Past performance is no guarantee of future results. 
 <!-- BOUNDARY_START type="image" id="p1_image_2" page="1" filename="fig_p1_2.png" has_caption="no" breadcrumbs="Uncovering Alpha in AI's Rate of Change" -->
 **Image**
 ![fig_p1_2.png](../figures/fig_p1_2.png)
-*AI Analysis:* The image displays a logo with the text "GLOBAL INSIGHT." There are no axes, trends, or data points to analyze as it is not a chart, diagram, or data table.
+*AI Analysis:* The image is a logo or banner for "Global Insight" and does not contain a chart, diagram, or data table. There are no axes, trends, or data insights to describe.
 <!-- BOUNDARY_END type="image" id="p1_image_2" -->
 
 <!-- BOUNDARY_START type="table" id="p1_table_1" page="1" rows="8" columns="2" has_caption="no" breadcrumbs="Uncovering Alpha in AI's Rate of Change" -->
@@ -66,15 +69,7 @@ Source: Eikon, MS Research. Past performance is no guarantee of future results. 
 | Jasper Lin Equity Strategist Jasper.Lin@morganstanley.com                                            | +1 212 761-0837  |
 | Michelle M. Weaver, CFA Equity Strategist Michelle.M.Weaver@morganstanley.com                        | +1 212 296-5254  |
 
-*AI Analysis:* The purpose of this table is to provide contact information for various professionals at Morgan Stanley, specifically equity strategists and analysts. The structure of the table is simple, consisting of two columns: the first column lists the names, titles, and email addresses of the individuals, and the second column provides their respective phone numbers.
-
-Key information includes:
-
-1. **Names and Positions**: Each row lists a professional's name along with their designation—either as an Equity Strategist or Equity Analyst—often followed by professional qualifications such as CFA or CPA.
-
-2. **Contact Information**: For each professional, the table provides their email address and phone number, indicating their availability for contact through these channels.
-
-This table is likely intended for use within the financial industry or
+*AI Analysis:* The table is a contact list for equity-related professionals at Morgan Stanley, including strategists and analysts. It is structured in two columns: the first column contains the name, title, and email address of each professional, while the second column provides their phone numbers. Key information includes the individual's role (e.g., Equity Strategist, Equity Analyst), their names, professional credentials (such as CFA, CPA), their email addresses, and phone numbers for direct contact. The table serves as a directory for reaching specific experts within the financial sector of Morgan Stanley.
 <!-- BOUNDARY_END type="table" id="p1_table_1" -->
 
 <!-- BOUNDARY_START type="paragraph" id="p1_text_6" page="1" char_count="101" word_count="17" breadcrumbs="Uncovering Alpha in AI's Rate of Change" -->

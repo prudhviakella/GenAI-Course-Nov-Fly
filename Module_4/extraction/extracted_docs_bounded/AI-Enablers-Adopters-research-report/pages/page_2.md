@@ -12,17 +12,16 @@
 **Image**
 *Caption:* Exhibit 2: Morgan Stanley classification for how AI Rate of Change "Exposure" is scored
 ![fig_p2_1.png](../figures/fig_p2_1.png)
-*AI Analysis:* This is a diagram. It visually represents a classification system for a company's AI exposure according to Morgan Stanley.
+*AI Analysis:* This visual is a diagram. 
 
-Axes and Layout:
-- Horizontal Axis: Indicates the increasing importance of AI exposure from left to right.
+**Axes:**
+- Horizontal Axis: Represents "Increasing Importance."
 
-Key Components:
-- Categories: Listed from left to right are "Disrupted," "Wildcard," "Don’t Know," "Protected," "Adopter," "Enabler," and "Enabler & Adopter."
-
-Trends and Insights:
-- The progression suggests a shift from uncertainty or minimal relevance in AI ("Disrupted," "Wildcard") to strategic and integral use of AI ("Enabler & Adopter").
-- The positioning also indicates an increasing level of engagement or integration of AI within a company's operations.
+**Trends and Key Insights:**
+- The diagram categorizes companies based on their AI exposure. 
+- Categories range from "Disrupted" to "Enabler & Adopter," suggesting a continuum from minimal to significant AI engagement.
+- Categories are: Disrupted, Wildcard, Don't Know, Protected, Adopter, Enabler, Enabler & Adopter.
+- As the importance increases, the classification moves from potentially negative or uncertain impacts (Disrupted, Wildcard) to positive engagement and leadership in AI (Adopter, Enabler, Enabler & Adopter).
 <!-- BOUNDARY_END type="image" id="p2_image_1" -->
 
 <!-- BOUNDARY_START type="paragraph" id="p2_text_1" page="2" char_count="31" word_count="4" breadcrumbs="Mapping AI's Rate of Change in Charts" -->
@@ -33,21 +32,19 @@ Source: Morgan Stanley Research
 **Image**
 *Caption:* Exhibit 4: Most analyst reclassifications are by multiple increments to the upside and downside
 ![fig_p2_2.png](../figures/fig_p2_2.png)
-*AI Analysis:* This is a chart. 
+*AI Analysis:* This is a bar chart.
 
 **Axes:**
-- **X-axis:** Displays the magnitude of change in increments, ranging from -5 to 5.
-- **Y-axis:** Represents the number of analyst reclassifications, ranging from 0 to 140.
+- **X-axis:** Represents the magnitude of change in analyst reclassifications, ranging from -5 to 5. 
+- **Y-axis:** Represents the frequency of reclassifications, with values from 0 to 140.
 
 **Trends:**
-- Most reclassifications occur at increments of +1 and +2, with significant peaks.
-- Positive changes dominate, especially at increments +1 and +2.
-- Exposure and materiality changes increase more on the positive side compared to negative.
+- **Negative Changes:** Limited activity, with most significant reclassifications being small, peaking at -2 with 41 exposure and 38 materiality changes.
+- **Positive Changes:** More frequent, especially at +2 with 132 materiality and 103 exposure changes, indicating a trend towards reclassification in a positive direction.
 
 **Key Insights:**
-- The most common changes are +1 and +2, indicating analysts frequently reclassify by these increments.
-- Positive reclassifications are more frequent than negative, suggesting an overall optimistic adjustment trend.
-- Materiality changes lead at +2, indicating a focus on significant positive material changes.
+- Analysts predominantly reclassify by +2 increments, indicating a tendency towards more positive outlooks.
+- Positive changes are significantly more common than negative ones, suggesting optimistic adjustments.
 <!-- BOUNDARY_END type="image" id="p2_image_2" -->
 
 <!-- BOUNDARY_START type="paragraph" id="p2_text_2" page="2" char_count="133" word_count="21" breadcrumbs="Mapping AI's Rate of Change in Charts" -->
@@ -70,18 +67,23 @@ Source: Morgan Stanley Research; Last Price - MDB - $246, CFLT - $29, ESTC - $10
 **Image**
 *Caption:* Exhibit 3: Morgan Stanley classification for how AI Rate of Change "Materiality" is scored
 ![fig_p2_3.png](../figures/fig_p2_3.png)
-*AI Analysis:* This visual is a chart. 
+*AI Analysis:* This is a diagram illustrating the classification of AI Materiality in relation to a company's investment thesis. 
 
-**Axes and Elements:**
-- **Horizontal Axis:** Represents "Increasing Importance" of AI to the investment thesis of a company.
-- **Categories:** Insignificant, Don't Know, Moderate, Significant, Core to Thesis.
+**Axes:**
+- Horizontal Axis: Represents the increasing importance of AI to the investment thesis of a company.
+
+**Categories:**
+1. Insignificant
+2. Don't Know
+3. Moderate
+4. Significant
+5. Core to Thesis
 
 **Trends and Key Insights:**
-- As AI importance increases from "Insignificant" to "Core to Thesis," investment materiality improves.
-- Movement to higher importance (rightward) is indicated with a "+1" suggesting positive scoring.
-- Moving to lower importance (leftward) is indicated with a "-1" suggesting negative scoring.
-
-This chart classifies the significance of AI in a company’s investment strategy and scores it accordingly.
+- The diagram uses a horizontal progression to show increasing importance from "Insignificant" to "Core to Thesis."
+- There is an upward positive adjustment (+1) when moving from less important (left side) to more important categories (right side).
+- A downward negative adjustment (-1) occurs when moving in the opposite direction, indicating a decrease in importance.
+- The classification helps in assessing how critical AI is to the investment rationale for a company.
 <!-- BOUNDARY_END type="image" id="p2_image_3" -->
 
 <!-- BOUNDARY_START type="paragraph" id="p2_text_5" page="2" char_count="31" word_count="4" breadcrumbs="Exhibit 6:" -->
@@ -92,16 +94,19 @@ Source: Morgan Stanley Research
 **Image**
 *Caption:* Exhibit 5: Steady progress is being made by companies in conveying their investment and equity story as it relates to AI
 ![fig_p2_4.png](../figures/fig_p2_4.png)
-*AI Analysis:* This visual is a chart with bar graphs. The chart compares the perception of companies' ability to convey their investment and equity stories related to AI over three surveys.
+*AI Analysis:* This is a bar chart. 
 
 **Axes:**
-- **X-axis:** Three surveys (Survey 1, Survey 2, Survey 3).
-- **Y-axis:** Percentage, ranging from 0% to 80%.
+- X-axis: Surveys (Survey 1, Survey 2, Survey 3)
+- Y-axis: Percentage (0% to 80%)
+
+**Trends:**
+- The "Insignificant/Don't Know" category shows a downward trend, decreasing from 73% in Survey 1 to 67% in Survey 3.
+- The "Core/Significant/Moderate" category is trending upward, increasing from 27% in Survey 1 to 33% in Survey 3.
 
 **Key Insights:**
-- There is a declining trend in the "Insignificant/Don't Know" category from 73% in Survey 1 to 67% in Survey 3.
-- The "Core/Significant/Moderate" category is gradually increasing from 27% in Survey 1 to 33% in Survey 3.
-- This indicates steady progress by companies in conveying their AI-related investment and equity stories over time.
+- Companies are gradually improving in conveying their AI investment and equity stories, as more respondents identify AI's significance over time.
+- There's a consistent shift from uncertainty or insignificance towards recognizing AI's core, significant, or moderate role.
 <!-- BOUNDARY_END type="image" id="p2_image_4" -->
 
 <!-- BOUNDARY_START type="paragraph" id="p2_text_6" page="2" char_count="133" word_count="21" breadcrumbs="Exhibit 6:" -->

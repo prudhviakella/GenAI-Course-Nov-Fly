@@ -270,12 +270,13 @@ def process_image(item: PictureItem, doc, page: int, output_dir: Path,
     # Check for caption
     caption = None
     if next_item and isinstance(next_item, TextItem):
+        label = next_item.label
         text = next_item.text.strip()
-        is_caption = (
-            text.startswith(('Exhibit', 'Figure', 'Table', 'Chart', 'Fig', 'Source:')) or
-            'Source:' in text or (len(text) < 200 and ':' in text)
-        )
-        if is_caption:
+        # is_caption = (
+        #     text.startswith(('Exhibit', 'Figure', 'Table', 'Chart', 'Fig', 'Source:')) or
+        #     'Source:' in text or (len(text) < 200 and ':' in text)
+        # )
+        if label == 'caption':
             caption = text
 
     # Extract and save image
