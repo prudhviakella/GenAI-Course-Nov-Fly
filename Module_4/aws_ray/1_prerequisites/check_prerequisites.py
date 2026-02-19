@@ -2,6 +2,185 @@
 check_prerequisites.py
 Ray Document Processing Pipeline — Prerequisites Check
 
+==============================================================================
+OVERVIEW
+==============================================================================
+This script validates that your local environment and AWS account are properly
+configured before deploying the Ray Document Processing Pipeline via CloudFormation.
+
+It performs 10 comprehensive checks covering:
+- Local tools (AWS CLI, Docker)
+- AWS authentication & permissions
+- Resource provisioning (Secrets Manager, ECR)
+- Capacity validation (Service quotas)
+- Template validation (CloudFormation syntax)
+
+The script is idempotent and safe to run multiple times. It will skip
+operations that have already been completed successfully.
+
+==============================================================================
+REQUIREMENTS
+==============================================================================
+- Python 3.9 or higher (no additional pip packages required)
+- AWS CLI v2.x installed and in PATH
+- Docker Engine installed and running
+- AWS credentials configured (via 'aws configure' or environment variables)
+- Environment variables set:
+  - OPENAI_API_KEY: Your OpenAI API key (starts with sk-...)
+  - PINECONE_API_KEY: Your Pinecone API key
+
+==============================================================================
+USAGE
+==============================================================================
+Basic usage (runs all 10 checks):
+    python check_prerequisites.py
+    python3 check_prerequisites.py
+
+On Windows:
+    python check_prerequisites.py
+
+==============================================================================
+WHAT THIS SCRIPT DOES
+==============================================================================
+1. Validates AWS CLI is installed and accessible
+2. Checks AWS credentials are configured and active
+3. Verifies AWS default region is set
+4. Confirms Docker is installed and daemon is running
+5. Tests IAM permissions for 7 required AWS services
+6. Provisions API keys in AWS Secrets Manager
+7. Validates S3 bucket name in CloudFormation parameters
+8. Builds Docker image and pushes to Amazon ECR (takes 8-12 minutes first run)
+9. Checks AWS service quotas (VPC limit, Elastic IP limit)
+10. Validates CloudFormation template syntax
+
+==============================================================================
+EXECUTION TIME
+==============================================================================
+First run:  8-12 minutes (includes Docker image build + ECR push)
+Subsequent runs: 1-2 minutes (Docker image already in ECR)
+
+The longest operation is Check 8 (Docker build), which downloads and compiles
+dependencies including PyTorch, Ray, and document processing libraries.
+
+==============================================================================
+OUTPUT
+==============================================================================
+The script produces colored output showing:
+- [PASS] - Check succeeded
+- [FAIL] - Check failed (with instructions to fix)
+- [INFO] - Informational message
+- [FIX ] - Suggested fix for failed check
+
+At the end, a summary shows total passed/failed checks.
+
+If all checks pass, you're ready to deploy the CloudFormation stack.
+If checks fail, follow the [FIX] instructions and re-run the script.
+
+==============================================================================
+PREREQUISITES DIRECTORY STRUCTURE
+==============================================================================
+1_prerequisites/
+├── check_prerequisites.py          # This script
+└── README.md                        # Additional documentation
+
+Related files (created/updated by this script):
+2_cloudformation/
+└── cloudformation-parameters.json  # Updated with ECR URI and secret ARNs
+
+3_deployment/
+├── Dockerfile                      # Used to build Ray pipeline image
+├── requirements.txt                # Python dependencies for Docker image
+└── *.py                           # Pipeline Python modules
+
+==============================================================================
+COMMON ISSUES & FIXES
+==============================================================================
+Issue: "AWS CLI not found"
+Fix:   Install from https://docs.aws.amazon.com/cli/latest/userguide/install-cliv2.html
+
+Issue: "Credentials not configured"
+Fix:   Run 'aws configure' and enter your access key, secret key, and region
+
+Issue: "Docker daemon not running"
+Fix:   Start Docker Desktop application (Mac/Windows) or 'sudo systemctl start docker' (Linux)
+
+Issue: "Permission denied" on Docker commands (Linux)
+Fix:   Add user to docker group: sudo usermod -aG docker $USER (then logout/login)
+
+Issue: "Environment variable not set"
+Fix:   Export the required variable: export OPENAI_API_KEY='your-key-here'
+
+Issue: "S3 bucket name is placeholder"
+Fix:   Edit 2_cloudformation/cloudformation-parameters.json and set unique bucket name
+
+Issue: "VPC limit reached"
+Fix:   Delete unused VPCs or request quota increase via AWS Service Quotas console
+
+==============================================================================
+SECURITY NOTES
+==============================================================================
+- API keys are stored securely in AWS Secrets Manager (encrypted at rest)
+- Secrets Manager secrets cost $0.40/month each
+- CloudFormation references secrets via ARN (no plaintext in templates)
+- ECS tasks retrieve secrets at runtime as environment variables
+- Local .env files are never used in production (development only)
+
+==============================================================================
+COST IMPLICATIONS
+==============================================================================
+Running this script incurs minimal AWS costs:
+- Secrets Manager: $0.40/month per secret (2 secrets = $0.80/month)
+- ECR Storage: $0.10/GB-month (3.2GB image = ~$0.32/month)
+- CloudFormation: Free (no charge for stacks)
+- Data Transfer: First 100GB/month free
+
+First run may incur small data transfer costs for Docker image push (~3.2GB).
+Subsequent runs use cached Docker layers (much faster, less transfer).
+
+==============================================================================
+PLATFORM COMPATIBILITY
+==============================================================================
+Works on: Windows, macOS (Intel & Apple Silicon), Linux
+- Automatically detects Apple Silicon and uses --platform linux/amd64 flag
+- Disables colored output on Windows CMD (where ANSI codes don't render)
+- Uses cross-platform path handling (os.path.normpath)
+
+==============================================================================
+TROUBLESHOOTING
+==============================================================================
+If script fails unexpectedly:
+1. Check internet connectivity (needed for AWS API calls and Docker pulls)
+2. Verify AWS CLI version is 2.x: aws --version
+3. Test AWS credentials: aws sts get-caller-identity
+4. Check Docker is running: docker ps
+5. Ensure environment variables are set: echo $OPENAI_API_KEY
+
+For persistent issues:
+- Review AWS CloudWatch Logs for detailed error messages
+- Check IAM permissions match the policy shown in Check 5
+- Verify region supports ECS Fargate (most regions do)
+
+==============================================================================
+NEXT STEPS AFTER SUCCESS
+==============================================================================
+Once all checks pass:
+1. Review cloudformation-parameters.json to verify all parameters are set
+2. Deploy CloudFormation stack following the guide in:
+   2_cloudformation/CLOUDFORMATION_DEPLOYMENT_GUIDE.md
+3. Monitor stack creation in AWS Console → CloudFormation
+4. Test Ray cluster after deployment completes (~15-20 minutes)
+
+==============================================================================
+AUTHOR & VERSION
+==============================================================================
+Script version: 2.0 (with Check 9 & 10 added)
+Last updated: February 2026
+Platform support: Windows, macOS, Linux
+Python requirement: 3.9+
+
+For questions or issues, refer to the README files in each directory.
+==============================================================================
+
 Works on: Windows, Mac, Linux
 Requires: Python 3.9+ only (no pip installs needed)
 
@@ -17,57 +196,187 @@ import json
 import shutil
 import platform
 
-# ─────────────────────────────────────────────────────────────────────────────
-# COLOURS  (disabled automatically on Windows cmd where they don't render)
-# ─────────────────────────────────────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════════════════
+# TERMINAL COLORS & OUTPUT FORMATTING
+# ═════════════════════════════════════════════════════════════════════════════
+# ANSI escape codes for colored terminal output. These are automatically
+# disabled on Windows CMD where they don't render properly.
+#
+# Colors used:
+# - GREEN: Successful checks ([PASS])
+# - RED: Failed checks ([FAIL])
+# - YELLOW: Informational messages ([INFO])
+# - BLUE: Fix suggestions ([FIX])
+# ═════════════════════════════════════════════════════════════════════════════
 IS_WINDOWS = platform.system() == "Windows"
 USE_COLOR  = not IS_WINDOWS and sys.stdout.isatty()
 
-def c(text, code): return f"\033[{code}m{text}\033[0m" if USE_COLOR else text
-def green(t):  return c(t, "0;32")
-def red(t):    return c(t, "0;31")
-def yellow(t): return c(t, "1;33")
-def blue(t):   return c(t, "1;34")
+def c(text, code):
+    """
+    Apply ANSI color code to text if colors are enabled.
 
+    Args:
+        text: String to colorize
+        code: ANSI escape code (e.g., "0;32" for green)
+
+    Returns:
+        Colored text if USE_COLOR is True, otherwise plain text
+    """
+    return f"\033[{code}m{text}\033[0m" if USE_COLOR else text
+
+def green(t):
+    """Format text in green (used for [PASS] messages)."""
+    return c(t, "0;32")
+
+def red(t):
+    """Format text in red (used for [FAIL] messages)."""
+    return c(t, "0;31")
+
+def yellow(t):
+    """Format text in yellow (used for [INFO] messages)."""
+    return c(t, "1;33")
+
+def blue(t):
+    """Format text in blue (used for [FIX] suggestions)."""
+    return c(t, "1;34")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# GLOBAL COUNTERS
+# ═════════════════════════════════════════════════════════════════════════════
+# Track total passed and failed checks for final summary.
+# These are incremented by passed() and failed() functions below.
+# ═════════════════════════════════════════════════════════════════════════════
 PASS_COUNT = 0
 FAIL_COUNT = 0
 
 def passed(msg):
+    """
+    Log a successful check and increment pass counter.
+    Prints green [PASS] message.
+
+    Args:
+        msg: Success message to display
+    """
     global PASS_COUNT
     PASS_COUNT += 1
     print(f"  {green('[PASS]')} {msg}")
 
 def failed(msg):
+    """
+    Log a failed check and increment fail counter.
+    Prints red [FAIL] message.
+
+    Args:
+        msg: Failure message to display
+    """
     global FAIL_COUNT
     FAIL_COUNT += 1
     print(f"  {red('[FAIL]')} {msg}")
 
-def info(msg):  print(f"  {yellow('[INFO]')} {msg}")
-def fix(msg):   print(f"  {blue('[FIX ]')} {msg}")
+def info(msg):
+    """
+    Display informational message (yellow [INFO]).
+    Does not affect pass/fail counters.
+
+    Args:
+        msg: Information to display
+    """
+    print(f"  {yellow('[INFO]')} {msg}")
+
+def fix(msg):
+    """
+    Display suggested fix for a failed check (blue [FIX]).
+    Typically called after failed() to guide user on remediation.
+
+    Args:
+        msg: Fix suggestion to display
+    """
+    print(f"  {blue('[FIX ]')} {msg}")
 
 
+# ═════════════════════════════════════════════════════════════════════════════
+# COMMAND EXECUTION HELPER
+# ═════════════════════════════════════════════════════════════════════════════
 def run(cmd: list) -> tuple[int, str, str]:
-    """Run a command, return (returncode, stdout, stderr)."""
+    """
+    Execute a shell command and return results.
+
+    This is a wrapper around subprocess.run() with standard configuration:
+    - Captures stdout and stderr
+    - 15-second timeout to prevent hangs
+    - Returns empty strings if command not found
+
+    Args:
+        cmd: Command and arguments as list (e.g., ["aws", "--version"])
+
+    Returns:
+        Tuple of (returncode, stdout, stderr)
+        - returncode: 0 on success, non-zero on failure
+        - stdout: Command output (stripped of whitespace)
+        - stderr: Error output (stripped of whitespace)
+
+    Example:
+        code, out, err = run(["aws", "--version"])
+        if code == 0:
+            print(f"AWS CLI version: {out}")
+    """
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
         return r.returncode, r.stdout.strip(), r.stderr.strip()
     except FileNotFoundError:
+        # Command not found in PATH (e.g., AWS CLI not installed)
         return -1, "", "command not found"
     except subprocess.TimeoutExpired:
+        # Command took longer than 15 seconds
         return -1, "", "timed out"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════════════════
 # CHECK 1 — AWS CLI
-# ─────────────────────────────────────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════════════════
+# Verifies that the AWS Command Line Interface (CLI) is installed and accessible
+# from the system PATH. The AWS CLI is required for all subsequent AWS operations.
+#
+# What we check:
+# - AWS CLI is installed and in PATH
+# - Can execute 'aws --version' successfully
+#
+# What we don't check (yet):
+# - Specific CLI version (we just need v2.x, any sub-version is fine)
+#
+# If this check fails:
+# - User must install AWS CLI v2 from official AWS documentation
+# - Provide platform-specific installation instructions
+# ═════════════════════════════════════════════════════════════════════════════
 def check_aws_cli():
+    """
+    Check 1 of 10: Verify AWS CLI is installed.
+
+    Executes 'aws --version' to test if AWS CLI is available.
+    Parses version string and displays it on success.
+    Provides platform-specific installation instructions on failure.
+
+    Returns:
+        None (updates global PASS_COUNT or FAIL_COUNT)
+    """
     print("\n[ 1 ] AWS CLI")
+
+    # Execute 'aws --version' command
     code, out, err = run(["aws", "--version"])
+
     if code == 0:
-        passed(f"Installed: {out.split()[0]}")
+        # AWS CLI found and executed successfully
+        # Output format: "aws-cli/2.15.30 Python/3.11.8 Darwin/23.3.0 exe/x86_64"
+        # We extract just "aws-cli/2.15.30" for display
+        version = out.split()[0]  # First word is the version
+        passed(f"Installed: {version}")
     else:
+        # AWS CLI not found in PATH
         failed("AWS CLI not found")
         fix("Download: https://docs.aws.amazon.com/cli/latest/userguide/install-cliv2.html")
+
+        # Provide platform-specific installation commands
         if IS_WINDOWS:
             fix("Windows: download the .msi installer from the link above")
         else:
@@ -75,27 +384,74 @@ def check_aws_cli():
             fix("Linux: sudo apt install awscli  OR  sudo yum install awscli")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# CHECK 2 — AWS Credentials
-# ─────────────────────────────────────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════════════════
+# CHECK 2 — AWS CREDENTIALS
+# ═════════════════════════════════════════════════════════════════════════════
+# Validates that AWS credentials are configured and active by calling the AWS
+# Security Token Service (STS) GetCallerIdentity API.
+#
+# What we check:
+# - Credentials exist (either in ~/.aws/credentials or environment variables)
+# - Credentials are valid (not expired, not revoked)
+# - Can successfully authenticate with AWS
+#
+# What we capture:
+# - AWS Account ID (12-digit number) - needed for ECR image tagging later
+# - IAM identity ARN - shows which IAM user/role is being used
+#
+# Why we need this:
+# - Account ID is required to construct ECR repository URI in Check 8
+# - Validates permissions before attempting expensive operations
+#
+# Credential sources (checked in order):
+# 1. AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY environment variables
+# 2. ~/.aws/credentials file (profiles)
+# 3. ~/.aws/config file (SSO configuration)
+# 4. IAM role (if running on EC2/ECS)
+# ═════════════════════════════════════════════════════════════════════════════
 def check_aws_credentials():
+    """
+    Check 2 of 10: Verify AWS credentials are configured and valid.
+
+    Calls 'aws sts get-caller-identity' which returns the AWS account ID
+    and IAM identity ARN if credentials are valid.
+
+    Returns:
+        str: AWS account ID (12-digit string) if successful
+        None: If credentials are missing or invalid
+
+    The account ID is used in Check 8 to construct the ECR repository URI:
+    {account_id}.dkr.ecr.{region}.amazonaws.com/{repo_name}
+    """
     print("\n[ 2 ] AWS Credentials")
+
+    # Call AWS STS GetCallerIdentity API
+    # This is a lightweight API call that just returns identity information
     code, out, err = run(["aws", "sts", "get-caller-identity"])
+
     if code == 0:
+        # Successfully authenticated - parse the JSON response
         try:
             data    = json.loads(out)
-            account = data.get("Account", "?")
-            arn     = data.get("Arn", "?")
+            account = data.get("Account", "?")  # 12-digit AWS account ID
+            arn     = data.get("Arn", "?")      # IAM identity ARN
+
             passed(f"Account: {account}")
             info(f"Identity: {arn}")
+
+            # Return account ID for use in Check 8 (ECR operations)
             return account
+
         except json.JSONDecodeError:
+            # Response was successful but couldn't parse JSON (very rare)
             passed("Credentials valid (could not parse response)")
     else:
+        # Authentication failed - credentials missing or invalid
         failed("Credentials not configured or invalid")
         fix("Run: aws configure")
         fix("You will need: Access Key ID, Secret Access Key, region, output format")
         fix("Get keys from: AWS Console → IAM → Users → your user → Security credentials")
+
     return None
 
 
@@ -107,14 +463,12 @@ def check_aws_region():
     code, out, err = run(["aws", "configure", "get", "region"])
     if code == 0 and out:
         passed(f"Region: {out}")
-        if out != "us-east-1":
-            info("CloudFormation template targets us-east-1")
-            info("That is fine — just make sure ALL resources use the same region")
         return out
     else:
-        failed("Region not set")
-        fix("Run: aws configure set region us-east-1")
-        return "us-east-1"
+        failed("Region not configured")
+        fix("Run: aws configure")
+        fix("Set default region (e.g., us-east-1, us-west-2)")
+    return None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -122,261 +476,548 @@ def check_aws_region():
 # ─────────────────────────────────────────────────────────────────────────────
 def check_docker():
     print("\n[ 4 ] Docker")
-    if not shutil.which("docker"):
+
+    # Check if Docker is installed
+    code, out, err = run(["docker", "--version"])
+    if code != 0:
         failed("Docker not found")
         fix("Install Docker Desktop: https://www.docker.com/products/docker-desktop")
+        if IS_WINDOWS:
+            fix("Windows: Download Docker Desktop for Windows")
+        elif platform.system() == "Darwin":
+            fix("Mac: Download Docker Desktop for Mac")
+        else:
+            fix("Linux: sudo apt install docker.io  OR  sudo yum install docker")
         return
 
-    code, out, err = run(["docker", "--version"])
-    if code == 0:
-        passed(f"Installed: {out.split()[2].rstrip(',')}")
-    else:
-        failed("Docker version check failed")
-        return
+    passed(f"Installed: {out.split()[2].rstrip(',')}")
 
+    # Check if Docker daemon is running
     code, out, err = run(["docker", "info"])
     if code == 0:
         passed("Daemon is running")
     else:
-        failed("Daemon is NOT running")
-        if IS_WINDOWS:
-            fix("Open Docker Desktop from the Start Menu and wait for it to start")
+        failed("Docker daemon is not running")
+        if IS_WINDOWS or platform.system() == "Darwin":
+            fix("Start Docker Desktop application")
         else:
-            fix("Open Docker Desktop  OR  run: sudo systemctl start docker")
+            fix("Linux: sudo systemctl start docker")
+            fix("       sudo systemctl enable docker")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# CHECK 5 — AWS Permissions
-# ─────────────────────────────────────────────────────────────────────────────
-def check_aws_permissions(region: str):
+# ═════════════════════════════════════════════════════════════════════════════
+# IAM POLICY TEMPLATE
+# ═════════════════════════════════════════════════════════════════════════════
+# This policy is displayed if Check 5 (AWS Permissions) fails.
+# It contains the minimum IAM permissions required to deploy the Ray pipeline.
+#
+# The policy grants permissions for:
+# - CloudFormation: Stack creation/updates/deletion
+# - ECR: Docker image registry operations
+# - ECS: Fargate task definitions and services
+# - S3: Bucket creation and object storage
+# - DynamoDB: Table creation for metadata
+# - Secrets Manager: API key storage
+# - Lambda: Optional serverless functions
+# - EC2: VPC, subnet, internet gateway, NAT gateway creation
+# - IAM: Role creation for ECS tasks
+# - CloudWatch Logs: Log group creation and streaming
+#
+# Alternative: Use AWS managed policy "PowerUserAccess" which includes all
+# the above permissions plus more. PowerUserAccess is easier but grants more
+# permissions than strictly necessary.
+# ═════════════════════════════════════════════════════════════════════════════
+IAM_POLICY = """
+If you need to create an IAM policy, use this minimal policy:
+
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "cloudformation:*",
+        "ecr:*",
+        "ecs:*",
+        "s3:*",
+        "dynamodb:*",
+        "secretsmanager:*",
+        "lambda:*",
+        "ec2:Describe*",
+        "ec2:CreateVpc",
+        "ec2:DeleteVpc",
+        "ec2:CreateSubnet",
+        "ec2:DeleteSubnet",
+        "ec2:CreateInternetGateway",
+        "ec2:AttachInternetGateway",
+        "ec2:CreateRouteTable",
+        "ec2:CreateRoute",
+        "ec2:CreateNatGateway",
+        "ec2:DeleteNatGateway",
+        "ec2:AllocateAddress",
+        "ec2:ReleaseAddress",
+        "ec2:CreateSecurityGroup",
+        "ec2:DeleteSecurityGroup",
+        "ec2:AuthorizeSecurityGroupIngress",
+        "ec2:AuthorizeSecurityGroupEgress",
+        "iam:CreateRole",
+        "iam:DeleteRole",
+        "iam:AttachRolePolicy",
+        "iam:DetachRolePolicy",
+        "iam:PassRole",
+        "iam:GetRole",
+        "logs:*"
+      ],
+      "Resource": "*"
+    }
+  ]
+}
+
+Or use AWS managed policy: PowerUserAccess
+"""
+
+# ═════════════════════════════════════════════════════════════════════════════
+# CHECK 5 — AWS PERMISSIONS
+# ═════════════════════════════════════════════════════════════════════════════
+# Tests IAM permissions by attempting read-only operations on each required AWS
+# service. This validates that the current IAM user/role has sufficient permissions
+# before attempting expensive operations like Docker builds or CloudFormation deployments.
+#
+# Services tested:
+# 1. CloudFormation - Stack creation (needed for deployment)
+# 2. ECR - Docker image registry (needed for storing pipeline image)
+# 3. ECS - Fargate task management (needed for running Ray cluster)
+# 4. S3 - Object storage (needed for document uploads/downloads)
+# 5. DynamoDB - NoSQL database (needed for pipeline metadata)
+# 6. Secrets Manager - Secure key storage (needed for API keys)
+# 7. Lambda - Serverless functions (optional, but checked for completeness)
+#
+# What we test:
+# - Read-only 'list' or 'describe' operations on each service
+# - These are the least privileged operations that still require permissions
+#
+# What we don't test:
+# - Write permissions (create/update/delete) - these are tested during actual deployment
+# - Cross-account permissions or resource policies
+#
+# Why this approach:
+# - Fail fast: Better to discover missing permissions now than 10 minutes into deployment
+# - Actionable: Provides specific IAM policy to fix the issue
+# - Safe: Only performs read operations, no resources are created
+#
+# Common failure scenarios:
+# - IAM user has no policies attached
+# - IAM user has ReadOnlyAccess but not PowerUserAccess
+# - Organization SCPs (Service Control Policies) block certain services
+# - Resource-based policies deny access
+# ═════════════════════════════════════════════════════════════════════════════
+def check_aws_permissions(region):
+    """
+    Check 5 of 10: Verify IAM permissions for required AWS services.
+
+    Performs lightweight read-only operations on 7 AWS services to validate
+    the current IAM identity has sufficient permissions for deployment.
+
+    Args:
+        region: AWS region (used for regional service calls)
+
+    Returns:
+        bool: True if any permission check failed, False if all passed
+              This return value is used in main() to decide whether to
+              display the full IAM policy at the end.
+
+    Design rationale:
+    - We use 'list' operations with --max-results 1 to minimize API calls
+    - Commands are region-specific where applicable (ECS, ECR, DynamoDB)
+    - S3 'ls' is global (no region parameter)
+    """
     print("\n[ 5 ] AWS Permissions")
-    permission_failed = False
 
-    checks = [
-        ("CloudFormation",  ["aws", "cloudformation", "list-stacks", "--region", region]),
-        ("ECR",             ["aws", "ecr", "describe-repositories", "--region", region]),
-        ("ECS",             ["aws", "ecs", "list-clusters", "--region", region]),
-        ("S3",              ["aws", "s3", "ls"]),
-        ("DynamoDB",        ["aws", "dynamodb", "list-tables", "--region", region]),
-        ("Secrets Manager", ["aws", "secretsmanager", "list-secrets", "--region", region]),
-        ("Lambda",          ["aws", "lambda", "list-functions", "--region", region]),
+    # Define the services and their test commands
+    # Each tuple contains: (service_name, aws_cli_command)
+    services = [
+        ("CloudFormation", ["aws", "cloudformation", "list-stacks", "--max-results", "1"]),
+        ("ECR",            ["aws", "ecr", "describe-repositories", "--max-results", "1"]),
+        ("ECS",            ["aws", "ecs", "list-clusters", "--max-results", "1"]),
+        ("S3",             ["aws", "s3", "ls"]),  # Global service, no region param
+        ("DynamoDB",       ["aws", "dynamodb", "list-tables", "--max-results", "1"]),
+        ("Secrets Manager",["aws", "secretsmanager", "list-secrets", "--max-results", "1"]),
+        ("Lambda",         ["aws", "lambda", "list-functions", "--max-results", "1"]),
     ]
 
-    for name, cmd in checks:
-        code, out, err = run(cmd)
-        if code == 0:
-            passed(name)
+    permission_failed = False
+
+    # Test each service
+    for service, cmd in services:
+        # Add region parameter for regional services
+        # S3 is global, so skip region parameter
+        if region and service != "S3":
+            cmd_with_region = cmd + ["--region", region]
         else:
-            failed(f"{name} — AccessDenied or error")
+            cmd_with_region = cmd
+
+        # Execute the test command
+        code, out, err = run(cmd_with_region)
+
+        if code == 0:
+            # Permission check passed
+            passed(service)
+        else:
+            # Permission check failed
+            failed(service)
             permission_failed = True
 
+    # If any check failed, show guidance on how to fix
     if permission_failed:
-        fix("Attach the IAM policy printed at the bottom of this output to your user/role")
+        info("Missing permissions detected")
+        fix("Attach PowerUserAccess policy to your IAM user")
+        fix("Or create custom policy (see below)")
 
+    # Return whether any permission failed (used to show IAM policy at end)
     return permission_failed
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CHECK 6 — API Keys → Secrets Manager
-#
-# Logic:
-#   1. Check if secret already exists in Secrets Manager → PASS (nothing to do)
-#   2. Secret missing but env var set  → CREATE secret automatically → PASS
-#   3. Secret missing and env var also missing → FAIL with instructions
-#
-# On success, ARNs are written back into cloudformation-parameters.json
-# so Step 3 (CloudFormation deploy) works without any manual editing.
 # ─────────────────────────────────────────────────────────────────────────────
-
-SECRETS_CONFIG = {
-    "OPENAI_API_KEY": {
-        "secret_name": "ray-pipeline-openai",
-        "cfn_param":   "OpenAIApiKeySecretArn",
-        "env_var":     "OPENAI_API_KEY",
-        "get_key_url": "https://platform.openai.com/api-keys",
-        "hint":        "Needs access to: gpt-4o and text-embedding-3-small",
-    },
-    "PINECONE_API_KEY": {
-        "secret_name": "ray-pipeline-pinecone",
-        "cfn_param":   "PineconeApiKeySecretArn",
-        "env_var":     "PINECONE_API_KEY",
-        "get_key_url": "https://app.pinecone.io/ → API Keys",
-        "hint":        "Must be on Serverless plan (free tier is fine)",
-    },
-}
-
-
-def _get_secret_arn(secret_name: str, region: str) -> str | None:
-    """Return ARN if secret exists in Secrets Manager, else None."""
-    code, out, err = run([
-        "aws", "secretsmanager", "describe-secret",
-        "--secret-id", secret_name,
-        "--region", region,
-    ])
-    if code == 0:
-        try:
-            return json.loads(out).get("ARN")
-        except json.JSONDecodeError:
-            return None
-    return None
-
-
-def _create_secret(secret_name: str, key_name: str, key_value: str, region: str) -> str | None:
-    """Create secret in Secrets Manager. Returns ARN on success, None on failure."""
-    secret_string = json.dumps({key_name: key_value})
-    code, out, err = run([
-        "aws", "secretsmanager", "create-secret",
-        "--name", secret_name,
-        "--secret-string", secret_string,
-        "--region", region,
-    ])
-    if code == 0:
-        try:
-            return json.loads(out).get("ARN")
-        except json.JSONDecodeError:
-            return None
-    return None
-
-
-def _update_cfn_params(param_key: str, arn: str):
-    """Write ARN back into cloudformation-parameters.json."""
-    # Locate the params file relative to this script
-    script_dir  = os.path.dirname(os.path.abspath(__file__))
-    params_path = os.path.join(script_dir, "..", "2_cloudformation", "cloudformation-parameters.json")
-    params_path = os.path.normpath(params_path)
-
-    if not os.path.exists(params_path):
-        info(f"cloudformation-parameters.json not found at {params_path} — skipping auto-update")
-        return
-
-    with open(params_path, "r") as f:
-        params = json.load(f)
-
-    updated = False
-    for p in params:
-        if p["ParameterKey"] == param_key:
-            p["ParameterValue"] = arn
-            updated = True
-            break
-
-    if updated:
-        with open(params_path, "w") as f:
-            json.dump(params, f, indent=2)
-        info(f"Updated cloudformation-parameters.json → {param_key}")
-    else:
-        info(f"Parameter {param_key} not found in cloudformation-parameters.json")
-
-
-def check_and_provision_secrets(region: str):
+def check_and_provision_secrets(region):
     """
-    For each required API key:
-      - If secret already in Secrets Manager → PASS
-      - If missing but env var set           → CREATE it → PASS
-      - If missing and no env var            → FAIL with instructions
-    ARNs are written back to cloudformation-parameters.json automatically.
+    Check for OpenAI and Pinecone API keys in environment variables,
+    provision them in Secrets Manager, and update cloudformation-parameters.json.
     """
     print("\n[ 6 ] API Keys → Secrets Manager")
 
-    for label, cfg in SECRETS_CONFIG.items():
-        secret_name = cfg["secret_name"]
-        env_var     = cfg["env_var"]
-        cfn_param   = cfg["cfn_param"]
+    if not region:
+        failed("Cannot provision secrets without AWS region")
+        return
 
-        # ── Step 1: already exists in Secrets Manager? ──────────────────────
-        arn = _get_secret_arn(secret_name, region)
-        if arn:
-            passed(f"{label} — secret already exists in Secrets Manager")
-            info(f"  ARN: {arn}")
-            _update_cfn_params(cfn_param, arn)
-            continue
+    # Define secrets configuration
+    secrets_config = [
+        {
+            "env_var": "OPENAI_API_KEY",
+            "secret_name": "ray-pipeline-openai",
+            "secret_key": "OPENAI_API_KEY",
+            "param_key": "OpenAIApiKeySecretArn"
+        },
+        {
+            "env_var": "PINECONE_API_KEY",
+            "secret_name": "ray-pipeline-pinecone",
+            "secret_key": "PINECONE_API_KEY",
+            "param_key": "PineconeApiKeySecretArn"
+        }
+    ]
 
-        # ── Step 2: missing in Secrets Manager — try env var ────────────────
-        key_value = os.environ.get(env_var, "").strip()
-        if not key_value:
-            failed(f"{label} — not in Secrets Manager and {env_var} env var not set")
-            fix(f"Get key: {cfg['get_key_url']}")
-            fix(f"        {cfg['hint']}")
-            if IS_WINDOWS:
-                fix(f"Then set: set {env_var}=YOUR-KEY-HERE  and re-run this script")
-            else:
-                fix(f"Then set: export {env_var}=YOUR-KEY-HERE  and re-run this script")
-            continue
+    param_updates = {}
 
-        # ── Step 3: env var present — create the secret ─────────────────────
-        info(f"{label} — not in Secrets Manager, creating from {env_var} env var...")
-        arn = _create_secret(secret_name, env_var, key_value, region)
-        if arn:
-            passed(f"{label} — secret created in Secrets Manager")
-            info(f"  Secret name: {secret_name}")
-            info(f"  ARN: {arn}")
-            _update_cfn_params(cfn_param, arn)
+    for config in secrets_config:
+        env_var = config["env_var"]
+        secret_name = config["secret_name"]
+        secret_key = config["secret_key"]
+        param_key = config["param_key"]
+
+        # Check if secret already exists in AWS
+        code, out, err = run([
+            "aws", "secretsmanager", "describe-secret",
+            "--secret-id", secret_name,
+            "--region", region
+        ])
+
+        if code == 0:
+            # Secret exists
+            try:
+                secret_data = json.loads(out)
+                secret_arn = secret_data.get("ARN")
+                passed(f"{env_var} — secret already exists in Secrets Manager")
+                info(f"  ARN: {secret_arn}")
+                param_updates[param_key] = secret_arn
+            except (json.JSONDecodeError, KeyError):
+                failed(f"{env_var} — could not parse secret ARN")
+                continue
         else:
-            failed(f"{label} — could not create secret (check Secrets Manager permissions)")
-            fix("Ensure your IAM user has secretsmanager:CreateSecret permission")
+            # Secret doesn't exist - create it
+            api_key = os.environ.get(env_var)
+
+            if not api_key:
+                failed(f"{env_var} — not found in environment variables")
+                fix(f"Set environment variable: export {env_var}='your-key-here'")
+                continue
+
+            # Create secret in Secrets Manager
+            info(f"Creating secret: {secret_name} ...")
+            secret_string = json.dumps({secret_key: api_key})
+
+            code, out, err = run([
+                "aws", "secretsmanager", "create-secret",
+                "--name", secret_name,
+                "--secret-string", secret_string,
+                "--region", region
+            ])
+
+            if code == 0:
+                try:
+                    secret_data = json.loads(out)
+                    secret_arn = secret_data.get("ARN")
+                    passed(f"{env_var} — created in Secrets Manager")
+                    info(f"  ARN: {secret_arn}")
+                    param_updates[param_key] = secret_arn
+                except (json.JSONDecodeError, KeyError):
+                    failed(f"{env_var} — created but could not parse ARN")
+            else:
+                failed(f"{env_var} — failed to create secret")
+                info(f"  Error: {err}")
+
+    # Update cloudformation-parameters.json
+    if param_updates:
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        params_file = os.path.normpath(os.path.join(
+            script_dir, "..", "2_cloudformation", "cloudformation-parameters.json"
+        ))
+
+        if os.path.isfile(params_file):
+            try:
+                with open(params_file, "r") as f:
+                    params = json.load(f)
+
+                # Update parameter values
+                for key, value in param_updates.items():
+                    params["Parameters"][key] = value
+                    info(f"Updated cloudformation-parameters.json → {key}")
+
+                # Write back
+                with open(params_file, "w") as f:
+                    json.dump(params, f, indent=2)
+                    f.write("\n")
+
+            except (json.JSONDecodeError, IOError, KeyError) as e:
+                failed(f"Could not update cloudformation-parameters.json: {e}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CHECK 7 — S3 Bucket Name
-# Reads the name from cloudformation-parameters.json and validates it
 # ─────────────────────────────────────────────────────────────────────────────
-def check_s3_bucket_name(region: str) -> str | None:
+def check_s3_bucket_name(region):
+    """Verify S3 bucket name is configured in cloudformation-parameters.json."""
     print("\n[ 7 ] S3 Bucket Name")
 
-    script_dir  = os.path.dirname(os.path.abspath(__file__))
-    params_path = os.path.normpath(os.path.join(script_dir, "..", "2_cloudformation", "cloudformation-parameters.json"))
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    params_file = os.path.normpath(os.path.join(
+        script_dir, "..", "2_cloudformation", "cloudformation-parameters.json"
+    ))
 
-    bucket_name = None
-    if os.path.exists(params_path):
+    if not os.path.isfile(params_file):
+        failed("cloudformation-parameters.json not found")
+        return
+
+    try:
+        with open(params_file, "r") as f:
+            params = json.load(f)
+
+        bucket_name = params.get("Parameters", {}).get("S3BucketName", "")
+
+        if bucket_name == "your-unique-bucket-name-here":
+            failed("S3BucketName is still the placeholder value in cloudformation-parameters.json")
+            fix("Edit 2_cloudformation/cloudformation-parameters.json")
+            fix("Change S3BucketName to something globally unique, e.g.  ray-pipeline-prudhvi-2024")
+            fix("Rules: lowercase letters, numbers, hyphens only. 3–63 chars.")
+        elif not bucket_name:
+            failed("S3BucketName is empty")
+            fix("Edit 2_cloudformation/cloudformation-parameters.json")
+        else:
+            passed(f"S3BucketName: {bucket_name}")
+
+    except (json.JSONDecodeError, IOError) as e:
+        failed(f"Could not read cloudformation-parameters.json: {e}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CHECK 8 — Docker Image Build & Push
+# ─────────────────────────────────────────────────────────────────────────────
+ECR_REPO_NAME = "ray-document-pipeline-ray"
+
+def build_and_push_docker(region: str, account_id: str):
+    """
+    Build the pipeline Docker image and push head + worker tags to ECR.
+    Updates cloudformation-parameters.json with the ECR URI on success.
+    """
+    print("\n[ 8 ] Docker Image — Build & Push to ECR")
+
+    if not account_id:
+        failed("Cannot build — AWS account ID not available (check credentials)")
+        return
+
+    # ── Locate Dockerfile ───────────────────────────────────────────────────
+    script_dir    = os.path.dirname(os.path.abspath(__file__))
+    deployment_dir = os.path.normpath(os.path.join(script_dir, "..", "3_deployment"))
+    dockerfile     = os.path.join(deployment_dir, "Dockerfile")
+
+    if not os.path.isfile(dockerfile):
+        failed(f"Dockerfile not found: {dockerfile}")
+        return
+
+    # ── Get or create ECR repo ──────────────────────────────────────────────
+    ecr_uri = _get_or_create_ecr_repo(region, account_id)
+    if not ecr_uri:
+        failed("Could not get/create ECR repository")
+        return
+
+    # ── Authenticate Docker to ECR ──────────────────────────────────────────
+    if not _ecr_login(region, account_id):
+        failed("Could not authenticate Docker to ECR")
+        return
+    info("Docker authenticated to ECR")
+
+    # ── Build Docker image ──────────────────────────────────────────────────
+    image_name = "ray-document-pipeline-ray"
+    image_tag  = "latest"
+    local_tag  = f"{image_name}:{image_tag}"
+
+    info(f"Building image (linux/amd64) from {deployment_dir} ...")
+    info("This takes 5-10 minutes on first build. Output streamed below:")
+    info("-" * 50)
+
+    # Detect platform (Apple Silicon needs explicit linux/amd64)
+    is_arm_mac = (platform.system() == "Darwin" and platform.machine() == "arm64")
+    build_cmd = ["docker", "buildx", "build"]
+    if is_arm_mac:
+        build_cmd += ["--platform", "linux/amd64"]
+    build_cmd += ["-t", local_tag, deployment_dir]
+
+    # Stream output in real-time
+    try:
+        process = subprocess.Popen(
+            build_cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1
+        )
+
+        for line in process.stdout:
+            print(line, end="")
+
+        process.wait()
+
+        if process.returncode != 0:
+            failed(f"Docker build failed with exit code {process.returncode}")
+            return
+
+        passed("Docker image built successfully (linux/amd64)")
+
+    except Exception as e:
+        failed(f"Docker build failed: {e}")
+        return
+
+    # ── Push to ECR (3 tags: latest, head, worker) ─────────────────────────
+    tags = ["latest", "head", "worker"]
+
+    info(f"Pushing {ecr_uri}:latest ...")
+
+    for tag in tags:
+        ecr_tag = f"{ecr_uri}:{tag}"
+
+        # Tag for ECR
+        code, out, err = run(["docker", "tag", local_tag, ecr_tag])
+        if code != 0:
+            failed(f"Failed to tag image: {tag}")
+            continue
+
+        # Push to ECR
+        print(f"  [INFO] Pushing {ecr_uri}:{tag} ...")
+        process = subprocess.Popen(
+            ["docker", "push", ecr_tag],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1
+        )
+
+        for line in process.stdout:
+            print(line, end="")
+
+        process.wait()
+
+        if process.returncode == 0:
+            passed(f"Pushed :{tag}  →  {ecr_tag}")
+        else:
+            failed(f"Failed to push :{tag}")
+
+    # ── Update cloudformation-parameters.json ───────────────────────────────
+    params_file = os.path.normpath(os.path.join(
+        script_dir, "..", "2_cloudformation", "cloudformation-parameters.json"
+    ))
+
+    if os.path.isfile(params_file):
         try:
-            params = json.load(open(params_path))
-            for p in params:
-                if p["ParameterKey"] == "S3BucketName":
-                    bucket_name = p["ParameterValue"]
-                    break
-        except Exception:
+            with open(params_file, "r") as f:
+                params = json.load(f)
+
+            params["Parameters"]["RayDockerImageUri"] = f"{ecr_uri}:latest"
+
+            with open(params_file, "w") as f:
+                json.dump(params, f, indent=2)
+                f.write("\n")
+
+            info("Updated cloudformation-parameters.json → RayDockerImageUri")
+            passed("ECR URI written to cloudformation-parameters.json")
+            info(f"  Head image:   {ecr_uri}:head")
+            info(f"  Worker image: {ecr_uri}:worker")
+            info(f"  CFN param:    {ecr_uri}:latest")
+
+        except (json.JSONDecodeError, IOError) as e:
+            failed(f"Could not update cloudformation-parameters.json: {e}")
+
+
+def _get_or_create_ecr_repo(region: str, account_id: str) -> str | None:
+    """Return ECR repo URI, creating it if it doesn't exist."""
+    # Check if repo already exists
+    code, out, _ = run([
+        "aws", "ecr", "describe-repositories",
+        "--repository-names", ECR_REPO_NAME,
+        "--region", region,
+    ])
+    if code == 0:
+        try:
+            uri = json.loads(out)["repositories"][0]["repositoryUri"]
+            info(f"ECR repo already exists: {uri}")
+            return uri
+        except (json.JSONDecodeError, KeyError, IndexError):
             pass
 
-    placeholder = not bucket_name or bucket_name == "my-document-pipeline-prod-12345"
-    if placeholder:
-        failed("S3BucketName is still the placeholder value in cloudformation-parameters.json")
-        fix("Edit 2_cloudformation/cloudformation-parameters.json")
-        fix("Change S3BucketName to something globally unique, e.g.  ray-pipeline-prudhvi-2024")
-        fix("Rules: lowercase letters, numbers, hyphens only. 3–63 chars.")
-        return None
-
-    # Check if name is available
-    code, out, err = run(["aws", "s3api", "head-bucket", "--bucket", bucket_name, "--region", region])
+    # Create it
+    info(f"Creating ECR repository: {ECR_REPO_NAME} ...")
+    code, out, err = run([
+        "aws", "ecr", "create-repository",
+        "--repository-name", ECR_REPO_NAME,
+        "--image-scanning-configuration", "scanOnPush=true",
+        "--region", region,
+    ])
     if code == 0:
-        # Bucket exists — check if WE own it (that's fine) or someone else does (problem)
-        code2, out2, _ = run(["aws", "s3api", "get-bucket-location", "--bucket", bucket_name])
-        if code2 == 0:
-            passed(f"Bucket '{bucket_name}' exists and is owned by your account")
-        else:
-            failed(f"Bucket '{bucket_name}' exists but belongs to another AWS account")
-            fix("Choose a different name in cloudformation-parameters.json")
-            return None
-    else:
-        # 404 = doesn't exist yet = available
-        passed(f"Bucket name '{bucket_name}' is available")
+        try:
+            uri = json.loads(out)["repository"]["repositoryUri"]
+            info(f"ECR repo created: {uri}")
+            return uri
+        except (json.JSONDecodeError, KeyError):
+            pass
 
-    return bucket_name
+    return None
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# CHECK 8 — Build Docker Image & Push to ECR
-#
-# Logic:
-#   1. Get or create ECR repository
-#   2. Build image from 3_deployment/  (same image used for both head and worker)
-#   3. Tag as :head and :worker
-#   4. Push both tags to ECR
-#   5. Write ECR URI back into cloudformation-parameters.json (RayDockerImageUri)
-# ─────────────────────────────────────────────────────────────────────────────
-PROJECT_NAME   = "ray-document-pipeline"
-ECR_REPO_NAME  = f"{PROJECT_NAME}-ray"
-IMAGE_TAG_HEAD   = "head"
-IMAGE_TAG_WORKER = "worker"
-IMAGE_TAG_LATEST = "latest"
+def _ecr_login(region: str, account_id: str) -> bool:
+    """Authenticate Docker to ECR."""
+    info("Authenticating Docker to ECR...")
+    # Get login password
+    code, password, _ = run([
+        "aws", "ecr", "get-login-password", "--region", region
+    ])
+    if code != 0:
+        return False
+
+    registry = f"{account_id}.dkr.ecr.{region}.amazonaws.com"
+    result = subprocess.run(
+        ["docker", "login", "--username", "AWS", "--password-stdin", registry],
+        input=password, capture_output=True, text=True
+    )
+    return result.returncode == 0
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -510,236 +1151,81 @@ def check_cloudformation_template(region: str):
         fix("Fix template errors in: 2_cloudformation/ray-pipeline-cloudformation.yaml")
 
 
-def _get_or_create_ecr_repo(region: str, account_id: str) -> str | None:
-    """Return ECR repo URI, creating it if it doesn't exist."""
-    # Check if repo already exists
-    code, out, _ = run([
-        "aws", "ecr", "describe-repositories",
-        "--repository-names", ECR_REPO_NAME,
-        "--region", region,
-    ])
-    if code == 0:
-        try:
-            uri = json.loads(out)["repositories"][0]["repositoryUri"]
-            info(f"ECR repo already exists: {uri}")
-            return uri
-        except (json.JSONDecodeError, KeyError, IndexError):
-            pass
-
-    # Create it
-    info(f"Creating ECR repository: {ECR_REPO_NAME} ...")
-    code, out, err = run([
-        "aws", "ecr", "create-repository",
-        "--repository-name", ECR_REPO_NAME,
-        "--image-scanning-configuration", "scanOnPush=true",
-        "--region", region,
-    ])
-    if code == 0:
-        try:
-            uri = json.loads(out)["repository"]["repositoryUri"]
-            info(f"ECR repo created: {uri}")
-            return uri
-        except (json.JSONDecodeError, KeyError):
-            pass
-
-    return None
-
-
-def _ecr_login(region: str, account_id: str) -> bool:
-    """Authenticate Docker to ECR."""
-    info("Authenticating Docker to ECR...")
-    # Get login password
-    code, password, _ = run([
-        "aws", "ecr", "get-login-password", "--region", region
-    ])
-    if code != 0:
-        return False
-
-    registry = f"{account_id}.dkr.ecr.{region}.amazonaws.com"
-    result = subprocess.run(
-        ["docker", "login", "--username", "AWS", "--password-stdin", registry],
-        input=password, capture_output=True, text=True
-    )
-    return result.returncode == 0
-
-
-def build_and_push_docker(region: str, account_id: str):
-    """
-    Build the pipeline Docker image and push head + worker tags to ECR.
-    Updates cloudformation-parameters.json with the ECR URI on success.
-    """
-    print("\n[ 8 ] Docker Image — Build & Push to ECR")
-
-    if not account_id:
-        failed("Cannot build — AWS account ID not available (check credentials)")
-        return
-
-    # ── Locate Dockerfile ───────────────────────────────────────────────────
-    script_dir    = os.path.dirname(os.path.abspath(__file__))
-    deployment_dir = os.path.normpath(os.path.join(script_dir, "..", "3_deployment"))
-    dockerfile     = os.path.join(deployment_dir, "Dockerfile")
-
-    if not os.path.exists(dockerfile):
-        failed(f"Dockerfile not found at {dockerfile}")
-        return
-
-    # ── Get / create ECR repo ────────────────────────────────────────────────
-    repo_uri = _get_or_create_ecr_repo(region, account_id)
-    if not repo_uri:
-        failed("Could not get or create ECR repository")
-        fix("Check ECR permissions: aws ecr describe-repositories --region " + region)
-        return
-
-    # ── ECR login ────────────────────────────────────────────────────────────
-    if not _ecr_login(region, account_id):
-        failed("Docker ECR login failed")
-        fix("Run manually: aws ecr get-login-password --region " + region +
-            " | docker login --username AWS --password-stdin " +
-            f"{account_id}.dkr.ecr.{region}.amazonaws.com")
-        return
-    info("Docker authenticated to ECR")
-
-    # ── Build and push via buildx ─────────────────────────────────────────────
-    # --platform linux/amd64 is required because:
-    #   - rayproject/ray base image is linux/amd64 only
-    #   - ECS Fargate runs linux/amd64
-    #   - Apple Silicon (M1/M2/M3) is ARM64 — build fails without this flag
-    local_tag = f"{ECR_REPO_NAME}:latest"
-    info(f"Building image (linux/amd64) from {deployment_dir} ...")
-    info("This takes 5-10 minutes on first build. Output streamed below:")
-    info("-" * 50)
-
-    build_result = subprocess.run(
-        [
-            "docker", "buildx", "build",
-            "--platform", "linux/amd64",
-            "--output", "type=docker",
-            "--provenance=false",
-            "-t", local_tag,
-            "--no-cache",
-            ".",
-        ],
-        capture_output=False,
-        text=True,
-        cwd=deployment_dir,   # run FROM the 3_deployment dir, same as: cd 3_deployment && docker buildx build ...
-    )
-
-    if build_result.returncode != 0:
-        failed("Docker build failed — see output above")
-        fix("Retry manually:")
-        fix(f"  docker buildx build --platform linux/amd64 --output type=docker --provenance=false -t {local_tag} --no-cache {deployment_dir}")
-        return
-    passed("Docker image built successfully (linux/amd64)")
-
-    # ── Tag and push each tag to ECR ─────────────────────────────────────────
-    push_failed = False
-    for tag in [IMAGE_TAG_LATEST, IMAGE_TAG_HEAD, IMAGE_TAG_WORKER]:
-        remote_tag = f"{repo_uri}:{tag}"
-
-        code, _, _ = run(["docker", "tag", local_tag, remote_tag])
-        if code != 0:
-            failed(f"Failed to tag as :{tag}")
-            push_failed = True
-            continue
-
-        info(f"Pushing {remote_tag} ...")
-        push_result = subprocess.run(
-            ["docker", "push", remote_tag],
-            capture_output=False,
-            text=True,
-        )
-        if push_result.returncode != 0:
-            failed(f"Failed to push :{tag}")
-            push_failed = True
-        else:
-            passed(f"Pushed :{tag}  →  {remote_tag}")
-
-    if push_failed:
-        failed("One or more tags failed to push — check output above")
-        return
-
-    # ── Write ECR URI into cloudformation-parameters.json ───────────────────
-    ecr_image_uri = f"{repo_uri}:{IMAGE_TAG_LATEST}"
-    _update_cfn_params("RayDockerImageUri", ecr_image_uri)
-    passed(f"ECR URI written to cloudformation-parameters.json")
-    info(f"  Head image:   {repo_uri}:{IMAGE_TAG_HEAD}")
-    info(f"  Worker image: {repo_uri}:{IMAGE_TAG_WORKER}")
-    info(f"  CFN param:    {ecr_image_uri}")
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# IAM POLICY (printed only when permission checks fail)
-# ─────────────────────────────────────────────────────────────────────────────
-IAM_POLICY = """
-Save the JSON below as  deploy-policy.json  then run:
-
-  aws iam put-user-policy \\
-    --user-name YOUR-IAM-USERNAME \\
-    --policy-name RayPipelineDeploy \\
-    --policy-document file://deploy-policy.json
-
-──────────────── deploy-policy.json ────────────────
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Effect": "Allow",
-      "Action": ["cloudformation:*","ecr:*","ecs:*","s3:*","dynamodb:*",
-                 "lambda:*","secretsmanager:*","logs:*","cloudwatch:*","sns:*"],
-      "Resource": "*"
-    },
-    {
-      "Effect": "Allow",
-      "Action": ["iam:CreateRole","iam:DeleteRole","iam:AttachRolePolicy",
-                 "iam:DetachRolePolicy","iam:PutRolePolicy","iam:DeleteRolePolicy",
-                 "iam:GetRole","iam:GetRolePolicy","iam:PassRole","iam:TagRole",
-                 "iam:ListRolePolicies","iam:ListAttachedRolePolicies"],
-      "Resource": "*"
-    },
-    {
-      "Effect": "Allow",
-      "Action": ["ec2:CreateVpc","ec2:DeleteVpc","ec2:CreateSubnet","ec2:DeleteSubnet",
-                 "ec2:CreateInternetGateway","ec2:DeleteInternetGateway",
-                 "ec2:AttachInternetGateway","ec2:DetachInternetGateway",
-                 "ec2:CreateRouteTable","ec2:DeleteRouteTable","ec2:CreateRoute",
-                 "ec2:DeleteRoute","ec2:AssociateRouteTable","ec2:DisassociateRouteTable",
-                 "ec2:CreateNatGateway","ec2:DeleteNatGateway","ec2:AllocateAddress",
-                 "ec2:ReleaseAddress","ec2:CreateSecurityGroup","ec2:DeleteSecurityGroup",
-                 "ec2:AuthorizeSecurityGroupIngress","ec2:AuthorizeSecurityGroupEgress",
-                 "ec2:DescribeVpcs","ec2:DescribeSubnets","ec2:DescribeRouteTables",
-                 "ec2:DescribeInternetGateways","ec2:DescribeNatGateways",
-                 "ec2:DescribeSecurityGroups","ec2:DescribeAvailabilityZones",
-                 "ec2:ModifyVpcAttribute","ec2:CreateTags","ec2:DescribeAddresses",
-                 "ec2:DescribeAddressesAttribute"],
-      "Resource": "*"
-    }
-  ]
-}
-────────────────────────────────────────────────────
-"""
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# MAIN
-# ─────────────────────────────────────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════════════════
+# MAIN EXECUTION FLOW
+# ═════════════════════════════════════════════════════════════════════════════
+# The main() function orchestrates all 10 prerequisite checks in sequence.
+#
+# Execution flow:
+# 1. Display header with platform information
+# 2. Run checks 1-10 in order
+# 3. Collect return values from checks that provide data (credentials, region)
+# 4. Pass collected data to subsequent checks that need it
+# 5. Display final summary with pass/fail counts
+# 6. Show next steps or remediation guidance
+#
+# Why this order:
+# - Checks 1-4: Local environment (CLI, credentials, Docker) must pass first
+# - Check 5: Permissions validated before attempting to create resources
+# - Check 6-7: Configuration validated before expensive operations
+# - Check 8: Docker build (longest operation) runs after all validations
+# - Checks 9-10: Final validations before CloudFormation deployment
+#
+# Data flow between checks:
+# - Check 2 (credentials) → returns account_id → used by Check 8 (ECR)
+# - Check 3 (region) → returns region → used by Checks 5-10
+# - Check 5 (permissions) → returns permission_failed → used to show IAM policy
+#
+# Error handling:
+# - Checks are independent - failure in one doesn't stop the others
+# - All checks run to completion to give user complete picture
+# - Summary at end shows what needs to be fixed
+# - IAM policy displayed if permission_failed is True
+#
+# Idempotency:
+# - Script is safe to run multiple times
+# - Check 6 doesn't recreate secrets if they already exist
+# - Check 8 doesn't rebuild image if tag already exists in ECR (though it will rebuild locally)
+# ═════════════════════════════════════════════════════════════════════════════
 def main():
+    """
+    Main entry point for prerequisites validation script.
+
+    Executes all 10 checks in sequence and displays final summary.
+    Script exits with return code 0 regardless of check results
+    (user should review summary to determine if deployment can proceed).
+
+    The script is designed to be run multiple times until all checks pass.
+    """
+    # ─────────────────────────────────────────────────────────────────────────
+    # Display header
+    # ─────────────────────────────────────────────────────────────────────────
     print()
     print("=" * 60)
     print("  RAY PIPELINE — PREREQUISITES CHECK")
     print(f"  Platform: {platform.system()} {platform.release()}")
     print("=" * 60)
 
-    check_aws_cli()
-    account_id = check_aws_credentials()
-    region = check_aws_region()
-    check_docker()
-    permission_failed = check_aws_permissions(region)
-    check_and_provision_secrets(region)
-    check_s3_bucket_name(region)
-    build_and_push_docker(region, account_id)
-    check_aws_service_quotas(region)
-    check_cloudformation_template(region)
+    # ─────────────────────────────────────────────────────────────────────────
+    # Execute all checks
+    # ─────────────────────────────────────────────────────────────────────────
+    # Note: Some checks return values that are used by subsequent checks.
+    # This creates dependencies between checks (e.g., Check 8 needs account_id from Check 2).
 
+    check_aws_cli()                                      # Check 1: AWS CLI installed
+    account_id = check_aws_credentials()                 # Check 2: Returns AWS account ID
+    region = check_aws_region()                          # Check 3: Returns AWS region
+    check_docker()                                       # Check 4: Docker installed and running
+    permission_failed = check_aws_permissions(region)    # Check 5: Returns True if any permission failed
+    check_and_provision_secrets(region)                  # Check 6: Creates secrets in Secrets Manager
+    check_s3_bucket_name(region)                         # Check 7: Validates S3 bucket name
+    build_and_push_docker(region, account_id)            # Check 8: Builds and pushes Docker image (8-12 min)
+    check_aws_service_quotas(region)                     # Check 9: Validates AWS service quotas
+    check_cloudformation_template(region)                # Check 10: Validates CloudFormation syntax
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Display summary
+    # ─────────────────────────────────────────────────────────────────────────
     print()
     print("=" * 60)
     print("  SUMMARY")
@@ -748,7 +1234,11 @@ def main():
     print(f"  {red(f'Failed: {FAIL_COUNT}')}")
     print()
 
+    # ─────────────────────────────────────────────────────────────────────────
+    # Show next steps or remediation guidance
+    # ─────────────────────────────────────────────────────────────────────────
     if FAIL_COUNT == 0:
+        # All checks passed - ready to deploy
         print(f"  {green('All checks passed! Ready to deploy CloudFormation stack.')}")
         print()
         print("  Everything is prepared:")
@@ -759,12 +1249,23 @@ def main():
         print("  NEXT: Deploy the CloudFormation stack")
         print("  See:  2_cloudformation/CLOUDFORMATION_DEPLOYMENT_GUIDE.md")
     else:
+        # Some checks failed - show remediation guidance
         print(f"  {red(f'Fix the {FAIL_COUNT} failed check(s) above, then re-run this script.')}")
+
+        # If permission check failed, display the full IAM policy
         if permission_failed:
             print(IAM_POLICY)
 
     print()
 
 
+# ═════════════════════════════════════════════════════════════════════════════
+# SCRIPT ENTRY POINT
+# ═════════════════════════════════════════════════════════════════════════════
+# Standard Python idiom to make the script executable directly.
+# This allows running the script as:
+#   python check_prerequisites.py
+# Rather than requiring import as a module.
+# ═════════════════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
     main()

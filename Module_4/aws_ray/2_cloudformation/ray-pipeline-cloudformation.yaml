@@ -871,15 +871,9 @@ Resources:
               Value: auto
           Secrets:
             - Name: OPENAI_API_KEY
-              ValueFrom: !If
-                - CreateSecrets
-                - !Sub ${OpenAIApiKeySecret}:OPENAI_API_KEY::
-                - !Sub ${OpenAIApiKeySecretArn}:OPENAI_API_KEY::
+              ValueFrom: !If [CreateSecrets, !Sub '${OpenAIApiKeySecret}:OPENAI_API_KEY::', !Sub '${OpenAIApiKeySecretArn}:OPENAI_API_KEY::']
             - Name: PINECONE_API_KEY
-              ValueFrom: !If
-                - CreateSecrets
-                - !Sub ${PineconeApiKeySecret}:PINECONE_API_KEY::
-                - !Sub ${PineconeApiKeySecretArn}:PINECONE_API_KEY::
+              ValueFrom: !If [CreateSecrets, !Sub '${PineconeApiKeySecret}:PINECONE_API_KEY::', !Sub '${PineconeApiKeySecretArn}:PINECONE_API_KEY::']
           Command:
             - ray
             - start
@@ -926,15 +920,9 @@ Resources:
               Value: !Ref MetricsTable
           Secrets:
             - Name: OPENAI_API_KEY
-              ValueFrom: !If
-                - CreateSecrets
-                - !Sub ${OpenAIApiKeySecret}:OPENAI_API_KEY::
-                - !Sub ${OpenAIApiKeySecretArn}:OPENAI_API_KEY::
+              ValueFrom: !If [CreateSecrets, !Sub '${OpenAIApiKeySecret}:OPENAI_API_KEY::', !Sub '${OpenAIApiKeySecretArn}:OPENAI_API_KEY::']
             - Name: PINECONE_API_KEY
-              ValueFrom: !If
-                - CreateSecrets
-                - !Sub ${PineconeApiKeySecret}:PINECONE_API_KEY::
-                - !Sub ${PineconeApiKeySecretArn}:PINECONE_API_KEY::
+              ValueFrom: !If [CreateSecrets, !Sub '${PineconeApiKeySecret}:PINECONE_API_KEY::', !Sub '${PineconeApiKeySecretArn}:PINECONE_API_KEY::']
           LogConfiguration:
             LogDriver: awslogs
             Options:
