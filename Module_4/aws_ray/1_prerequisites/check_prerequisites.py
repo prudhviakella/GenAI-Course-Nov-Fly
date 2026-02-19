@@ -379,6 +379,137 @@ IMAGE_TAG_WORKER = "worker"
 IMAGE_TAG_LATEST = "latest"
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# CHECK 9 — AWS Service Quotas
+# ─────────────────────────────────────────────────────────────────────────────
+def check_aws_service_quotas(region: str):
+    """
+    Check AWS service quotas to prevent deployment failures.
+    Verifies:
+    - VPC count (default limit: 5 per region)
+    - Elastic IP count (default limit: 5 per region)
+    - ECS task quota (informational)
+    """
+    print("\n[ 9 ] AWS Service Quotas")
+
+    # ── Check VPC Count ─────────────────────────────────────────────────────
+    code, out, err = run([
+        "aws", "ec2", "describe-vpcs",
+        "--region", region,
+        "--query", "Vpcs[*].VpcId",
+        "--output", "json"
+    ])
+
+    if code == 0:
+        try:
+            vpcs = json.loads(out)
+            vpc_count = len(vpcs)
+            vpc_limit = 5  # Default AWS limit
+
+            if vpc_count >= vpc_limit:
+                failed(f"VPC limit reached: {vpc_count}/{vpc_limit} VPCs in {region}")
+                fix("CloudFormation will create a new VPC and may fail")
+                fix("Delete unused VPCs or request limit increase:")
+                fix("https://console.aws.amazon.com/servicequotas/home/services/vpc/quotas")
+            else:
+                passed(f"VPC quota OK: {vpc_count}/{vpc_limit} used")
+        except (json.JSONDecodeError, ValueError):
+            info("Could not parse VPC count (proceeding anyway)")
+    else:
+        info("Could not check VPC quota (proceeding anyway)")
+
+    # ── Check Elastic IP Count ──────────────────────────────────────────────
+    code, out, err = run([
+        "aws", "ec2", "describe-addresses",
+        "--region", region,
+        "--query", "Addresses[*].PublicIp",
+        "--output", "json"
+    ])
+
+    if code == 0:
+        try:
+            eips = json.loads(out)
+            eip_count = len(eips)
+            eip_limit = 5  # Default AWS limit
+
+            # NAT Gateway needs 1 EIP
+            if eip_count >= eip_limit:
+                failed(f"Elastic IP limit reached: {eip_count}/{eip_limit} in {region}")
+                fix("CloudFormation creates a NAT Gateway which needs 1 Elastic IP")
+                fix("Release unused EIPs or request limit increase:")
+                fix("https://console.aws.amazon.com/servicequotas/home/services/ec2/quotas/L-0263D0A3")
+            else:
+                passed(f"Elastic IP quota OK: {eip_count}/{eip_limit} used (NAT needs 1)")
+        except (json.JSONDecodeError, ValueError):
+            info("Could not parse Elastic IP count (proceeding anyway)")
+    else:
+        info("Could not check Elastic IP quota (proceeding anyway)")
+
+    # ── Informational: ECS Task Quota ───────────────────────────────────────
+    info("ECS Fargate task limit: 500 per service (default)")
+    info("If deploying large Ray clusters (>50 workers), monitor this quota")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CHECK 10 — CloudFormation Template Validation
+# ─────────────────────────────────────────────────────────────────────────────
+def check_cloudformation_template(region: str):
+    """
+    Validate the CloudFormation template syntax before deployment.
+    Catches template errors early, preventing 20-minute failed deployments.
+    """
+    print("\n[ 10 ] CloudFormation Template Validation")
+
+    # ── Locate CloudFormation Template ─────────────────────────────────────
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    template_path = os.path.normpath(os.path.join(
+        script_dir, "..", "2_cloudformation", "ray-pipeline-cloudformation.yaml"
+    ))
+
+    if not os.path.isfile(template_path):
+        failed(f"CloudFormation template not found: {template_path}")
+        return
+
+    info(f"Validating template: {os.path.basename(template_path)}")
+
+    # ── Run AWS CloudFormation Validate ────────────────────────────────────
+    code, out, err = run([
+        "aws", "cloudformation", "validate-template",
+        "--template-body", f"file://{template_path}",
+        "--region", region
+    ])
+
+    if code == 0:
+        try:
+            result = json.loads(out)
+            # Template is syntactically valid
+            passed("Template syntax valid")
+
+            # Show parameter count
+            params = result.get("Parameters", [])
+            if params:
+                info(f"Template has {len(params)} parameters")
+
+            # Show capabilities required (if any)
+            capabilities = result.get("Capabilities", [])
+            if capabilities:
+                info(f"Requires capabilities: {', '.join(capabilities)}")
+
+        except (json.JSONDecodeError, ValueError):
+            # Validation succeeded but couldn't parse response
+            passed("Template syntax valid (could not parse details)")
+    else:
+        # Validation failed
+        failed("Template validation failed")
+        if err:
+            # Print first 5 lines of error
+            error_lines = err.split('\n')[:5]
+            for line in error_lines:
+                if line.strip():
+                    fix(line.strip())
+        fix("Fix template errors in: 2_cloudformation/ray-pipeline-cloudformation.yaml")
+
+
 def _get_or_create_ecr_repo(region: str, account_id: str) -> str | None:
     """Return ECR repo URI, creating it if it doesn't exist."""
     # Check if repo already exists
@@ -606,6 +737,8 @@ def main():
     check_and_provision_secrets(region)
     check_s3_bucket_name(region)
     build_and_push_docker(region, account_id)
+    check_aws_service_quotas(region)
+    check_cloudformation_template(region)
 
     print()
     print("=" * 60)

@@ -21,7 +21,7 @@
   },
   {
     "ParameterKey": "RayDockerImageUri",
-    "ParameterValue": ""
+    "ParameterValue": "107282186797.dkr.ecr.us-east-1.amazonaws.com/ray-document-pipeline-ray:latest"
   },
   {
     "ParameterKey": "VpcCIDR",

@@ -1,27 +1,24 @@
 # Dockerfile for Ray Document Processing Pipeline
 #
-# This image contains all dependencies for running the pipeline
-# including Docling, OpenAI, Pinecone, and AWS integrations.
+# Uses Ray 2.53.0 with Python 3.12 for full compatibility with latest packages.
 #
 # Pipeline stages:
 #   1. Extraction  - docling_bounded_extractor.py  (Docling + GPT-4o Vision)
-#   2. Chunking    - comprehensive_chunker.py       (boundary-aware semantic chunking)
-#   3. Enrichment  - enrich_pipeline_openai.py      (OpenAI PII+NER+key-phrases)
-#   4. Embedding   - openai_embeddings.py           (text-embedding-3-small + tenacity)
+#   2. Chunking    - comprehensive_chunker.py      (boundary-aware semantic chunking)
+#   3. Enrichment  - enrich_pipeline_openai.py     (OpenAI PII+NER+key-phrases)
+#   4. Embedding   - openai_embeddings.py          (text-embedding-3-small + tenacity)
 #   5. Loading     - load_embeddings_to_pinecone.py (Pinecone serverless)
 #
 # Author: Prudhvi
 # Organization: Thoughtworks
 
-FROM rayproject/ray:2.9.0-py313
+FROM rayproject/ray:2.53.0-py312
 
 # Set working directory
 WORKDIR /app
 
 # System dependencies
 # poppler-utils: required by pdf2image for PDF -> PNG rendering
-# NOTE: tesseract-ocr removed - do_ocr=False in extractor (text-based PDFs only)
-# NOTE: spaCy removed - NLP enrichment is now handled by OpenAI gpt-4o-mini
 RUN sudo apt-get update && sudo apt-get install -y \
     poppler-utils \
     && sudo rm -rf /var/lib/apt/lists/*
@@ -30,12 +27,11 @@ RUN sudo apt-get update && sudo apt-get install -y \
 COPY requirements.txt .
 
 # Install Python dependencies
-# NOTE: torch / sentence-transformers / spacy removed from requirements.txt
-#       Image is now significantly smaller (~4 GB -> ~1.5 GB)
+# All packages now compatible with Python 3.12
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy all pipeline code
-COPY .. /app/
+COPY . /app/
 
 # Set environment variables
 ENV PYTHONUNBUFFERED=1

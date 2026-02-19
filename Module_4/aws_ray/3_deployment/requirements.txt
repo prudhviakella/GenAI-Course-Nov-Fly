@@ -1,20 +1,19 @@
 # =============================================================================
 # RAY DOCUMENT PIPELINE — REQUIREMENTS
 # =============================================================================
-# Strategy: pin only where version conflicts are known, let pip resolve the rest.
-# Python 3.9 (Ray 2.9.0 base image)
+# Python 3.12 (Ray 2.53.0 base image — rayproject/ray:2.53.0-py312)
+# All packages now compatible — no version ceiling constraints needed
+# =============================================================================
 
 # ── Ray ───────────────────────────────────────────────────────────────────────
-ray[default]==2.9.0
-ray[data]==2.9.0
+ray[default]==2.53.0
+ray[data]==2.53.0
 
 # ── AWS ───────────────────────────────────────────────────────────────────────
-# boto3/botocore pinned to match your course environment
 boto3==1.42.5
 
 # ── Document processing ───────────────────────────────────────────────────────
-# docling 2.69.1 = last release supporting Python 3.9 (2.70.0 dropped it)
-docling==2.69.1
+docling
 python-docx
 python-pptx
 openpyxl
@@ -28,7 +27,6 @@ beautifulsoup4
 openai
 
 # ── Vector database ───────────────────────────────────────────────────────────
-# pinecone>=3 uses the new unified package (replaces pinecone-client)
 pinecone==8.0.0
 
 # ── Data ─────────────────────────────────────────────────────────────────────
@@ -44,10 +42,10 @@ pillow
 tenacity
 tqdm
 rich
-tabulate          # used by pipeline summary outputs
+tabulate
 
 # ── Logging ──────────────────────────────────────────────────────────────────
-structlog         # used by pipeline stages for structured JSON logs
+structlog
 
 # ── Utilities ────────────────────────────────────────────────────────────────
 python-dotenv

@@ -320,13 +320,15 @@ def embed(client, text, model):
 
 def search(cursor, vec, schema, table, top_k):
     vec_str = '[' + ','.join(map(str, vec)) + ']'
-    cursor.execute(f"""
+    query = f"""
         SELECT id, content, metadata,
                1 - (embedding <=> %s::vector) AS similarity
         FROM {schema}.{table}
         ORDER BY embedding <=> %s::vector
         LIMIT %s
-    """, (vec_str, vec_str, top_k))
+    """
+    print(query)
+    cursor.execute(query, (vec_str, vec_str, top_k))
     return cursor.fetchall()
 
 
@@ -371,7 +373,9 @@ def run_query(cursor, client, embed_model, chat_model, schema, table,
 
     start = time.time()
     vec     = embed(client, q, embed_model)
+
     results = search(cursor, vec, schema, table, top_k)
+
     summary = summarise(client, chat_model, q, results)
     elapsed = time.time() - start
 
@@ -436,10 +440,10 @@ Examples:
         '--run-all', action='store_true',
         help="Run every query in the bank (costs ~$0.05 total)"
     )
-    parser.add_argument(
-        '--list-only', action='store_true',
-        help="Print all queries without running them"
-    )
+    # parser.add_argument(
+    #     '--list-only', action='store_true',
+    #     help="Print all queries without running them"
+    # )
     parser.add_argument(
         '--query-index', type=int, default=None,
         help="Run a single query by its 1-based index in the bank"
@@ -447,42 +451,44 @@ Examples:
 
     args = parser.parse_args()
 
-    # --- List mode ---
-    if args.list_only:
-        print(f"\n{len(QUERY_BANK)} queries in the bank:\n")
-        current_cat = None
-        for i, q in enumerate(QUERY_BANK, 1):
-            if q['category'] != current_cat:
-                current_cat = q['category']
-                print(f"\n  [{current_cat.upper()}]")
-            print(f"  {i:2}. {q['query']}")
-            print(f"      → {q['what_it_tests']}")
-        print()
-        return
+    # # --- List mode ---
+    # if args.list_only:
+    #     print(f"\n{len(QUERY_BANK)} queries in the bank:\n")
+    #     current_cat = None
+    #     for i, q in enumerate(QUERY_BANK, 1):
+    #         if q['category'] != current_cat:
+    #             current_cat = q['category']
+    #             print(f"\n  [{current_cat.upper()}]")
+    #         print(f"  {i:2}. {q['query']}")
+    #         print(f"      → {q['what_it_tests']}")
+    #     print()
+    #     return
 
     # --- Determine which queries to run ---
-    if args.query_index:
-        queries_to_run = [QUERY_BANK[args.query_index - 1]]
-    elif args.query_category:
-        queries_to_run = [q for q in QUERY_BANK if q['category'] == args.query_category]
-        if not queries_to_run:
-            print(f"No queries found for category '{args.query_category}'")
-            print(f"Available: {sorted(set(q['category'] for q in QUERY_BANK))}")
-            sys.exit(1)
-    elif args.run_all:
-        queries_to_run = QUERY_BANK
-    else:
-        # Default: show the query bank and ask
-        print(f"\n{len(QUERY_BANK)} queries available. Use one of:")
-        print("  --run-all                        run everything")
-        print("  --query-category <name>          run a category")
-        print("  --query-index <n>                run one query")
-        print("  --list-only                      list without running")
-        print("\nCategories:")
-        for cat in sorted(set(q['category'] for q in QUERY_BANK)):
-            count = sum(1 for q in QUERY_BANK if q['category'] == cat)
-            print(f"  {cat:<18} {count} queries")
-        return
+    # if args.query_index:
+    #     queries_to_run = [QUERY_BANK[args.query_index - 1]]
+    # elif args.query_category:
+    #     queries_to_run = [q for q in QUERY_BANK if q['category'] == args.query_category]
+    #     if not queries_to_run:
+    #         print(f"No queries found for category '{args.query_category}'")
+    #         print(f"Available: {sorted(set(q['category'] for q in QUERY_BANK))}")
+    #         sys.exit(1)
+    # elif args.run_all:
+    #     queries_to_run = QUERY_BANK
+    # else:
+    #     # Default: show the query bank and ask
+    #     print(f"\n{len(QUERY_BANK)} queries available. Use one of:")
+    #     print("  --run-all                        run everything")
+    #     print("  --query-category <name>          run a category")
+    #     print("  --query-index <n>                run one query")
+    #     print("  --list-only                      list without running")
+    #     print("\nCategories:")
+    #     for cat in sorted(set(q['category'] for q in QUERY_BANK)):
+    #         count = sum(1 for q in QUERY_BANK if q['category'] == cat)
+    #         print(f"  {cat:<18} {count} queries")
+    #     return
+
+    queries_to_run = [q for q in QUERY_BANK if q['category'] == "sectors"]
 
     # --- Run queries ---
     client = init_client(args.openai_api_key)
