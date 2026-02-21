@@ -21,9 +21,10 @@ from openai import OpenAI
 
 # Initialize OpenAI client
 client = OpenAI()
-
+messages = []
 
 def ask_ai(prompt: str, model: str = "gpt-4o") -> str:
+    global messages
     """
     Simple function to ask AI a question.
     
@@ -40,8 +41,9 @@ def ask_ai(prompt: str, model: str = "gpt-4o") -> str:
             messages=[
                 {"role": "user", "content": prompt}
             ],
-            n=2
+            n=1
         )
+
         print("\nAI's response:",response)
         for id,choice in enumerate(response.choices):
             print("#"*15)
@@ -65,7 +67,7 @@ if __name__ == "__main__":
     # Example 1: Simple question
     print("\nExample 1: Simple Question")
     print("-" * 70)
-    response = ask_ai("What is machine learning? Explain in 2 sentences.",model='gpt-5')
+    response = ask_ai("What is machine learning? Explain in 2 sentences.",model='gpt-5.2')
     print(response)
     
     # # Example 2: Classification
@@ -103,24 +105,24 @@ if __name__ == "__main__":
     # """
     # response = ask_ai(prompt)
     # print(response)
-    
-    print("\n" + "-"*70)
-    print("Quick start completed! Now try your own prompts.")
-    print("-"*70)
-    
-    # Interactive mode
-    print("\nTry it yourself! (Type 'quit' to exit)")
-    print("-" * 70)
-    
-    while True:
-        user_input = input("\nYour prompt: ")
-        
-        if user_input.lower() in ['quit', 'exit', 'q']:
-            print("\nGoodbye!")
-            break
-        
-        if user_input.strip():
-            print("\nAI Response:")
-            print("-" * 70)
-            response = ask_ai(user_input)
-            print(response)
+    #
+    # print("\n" + "-"*70)
+    # print("Quick start completed! Now try your own prompts.")
+    # print("-"*70)
+    #
+    # # Interactive mode
+    # print("\nTry it yourself! (Type 'quit' to exit)")
+    # print("-" * 70)
+    #
+    # while True:
+    #     user_input = input("\nYour prompt: ")
+    #
+    #     if user_input.lower() in ['quit', 'exit', 'q']:
+    #         print("\nGoodbye!")
+    #         break
+    #
+    #     if user_input.strip():
+    #         print("\nAI Response:")
+    #         print("-" * 70)
+    #         response = ask_ai(user_input)
+    #         print(response)
