@@ -46,7 +46,7 @@ import os
 import shutil  # For directory operations (copy, delete)
 from pathlib import Path  # Modern way to handle file paths
 from datetime import datetime
-
+import json as _json
 
 logger = logging.getLogger(__name__)
 
@@ -1027,60 +1027,106 @@ def setup_logging(level: str = 'INFO'):
     logging.getLogger('botocore').setLevel(logging.WARNING)
     logging.getLogger('urllib3').setLevel(logging.WARNING)
 
+# Explicit fallback chain tried in order when auto-detection fails.
+# latin-1 is ALWAYS last — it accepts every byte 0x00–0xFF without error,
+# making it an unconditional safety net.
+_ENCODING_FALLBACKS = ["utf-8", "utf-8-sig", "windows-1252", "latin-1"]
 
-# ============================================================================
-# SUMMARY FOR STUDENTS
-# ============================================================================
-#
-# This file demonstrates several important software engineering principles:
-#
-# 1. ABSTRACTION
-#    - Hide AWS SDK complexity behind simple interface
-#    - S3Helper provides upload/download without worrying about boto3
-#
-# 2. ERROR HANDLING
-#    - All methods return True/False (easy to check)
-#    - Exceptions are caught and logged (no crashes)
-#    - Calling code decides how to handle failures
-#
-# 3. RESOURCE MANAGEMENT
-#    - LocalFileManager creates temporary workspaces
-#    - Always cleanup in finally block (prevent leaks)
-#    - Disk space stays constant even after 1000s of documents
-#
-# 4. DRY PRINCIPLE (Don't Repeat Yourself)
-#    - S3 operations defined once, used everywhere
-#    - Logging format defined once (setup_logging)
-#    - Timestamp format consistent (get_timestamp)
-#
-# 5. TESTABILITY
-#    - Easy to mock S3Helper for tests (no real S3 needed)
-#    - LocalFileManager can use test directory
-#    - Each function has single responsibility (easy to test)
-#
-# Common Patterns Demonstrated:
-#
-# ✓ Wrapper Pattern (S3Helper wraps boto3)
-# ✓ Builder Pattern (S3Helper.upload_directory builds paths)
-# ✓ Singleton Pattern (one logging config)
-# ✓ Resource Acquisition Is Initialization (RAII via finally)
-# ✓ Defensive Programming (check exists before delete)
-#
-# Questions for Students:
-#
-# 1. Why return True/False instead of raising exceptions?
-#    → Easier to use, calling code decides how to handle failure
-#
-# 2. Why use Path objects instead of strings?
-#    → Modern, cross-platform, convenient operators
-#
-# 3. Why always cleanup in finally block?
-#    → Runs even if exception occurs, prevents disk leaks
-#
-# 4. Why suppress boto3 logs?
-#    → Too noisy, creates huge log files, hard to find our logs
-#
-# 5. Why use UTC timestamps?
-#    → No timezone confusion, consistent globally, sortable
-#
-# =============================================================================
+
+def read_json_robust(path: str) -> dict:
+    """
+    Read a JSON file safely regardless of its byte encoding.
+
+    Strategy (four-pass):
+      1. Read raw bytes — never raises, no encoding assumption
+      2. charset-normalizer auto-detection (ships with requests/openai)
+      3. Explicit fallback chain: utf-8 → utf-8-sig → windows-1252 → latin-1
+      4. latin-1 + errors='replace' — unconditional last resort, never fails
+
+    latin-1 can decode every possible byte value (0x00–0xFF maps 1:1 to
+    Unicode codepoints U+0000–U+00FF) so step 4 is mathematically guaranteed
+    to succeed. Any genuinely undecodable byte becomes U+FFFD (replacement char).
+
+    A WARNING is logged when a non-UTF-8 encoding is used so you can trace
+    which upstream stage wrote the file with the wrong encoding.
+
+    Args:
+        path: Path to the JSON file (str or Path).
+
+    Returns:
+        Parsed dict or list.
+
+    Raises:
+        FileNotFoundError  — file does not exist.
+        json.JSONDecodeError — file is not valid JSON after decoding.
+        (Never raises UnicodeDecodeError.)
+    """
+    raw = open(str(path), "rb").read()
+
+    text = None
+    detected_enc = None
+
+    # Pass 1 — charset-normalizer (accurate, handles Windows-1252 vs Latin-1)
+    try:
+        from charset_normalizer import from_bytes
+        best = from_bytes(raw).best()
+        if best is not None:
+            detected_enc = best.encoding
+            text = str(best)
+            logger.debug("read_json_robust: %s detected as %s", path, detected_enc)
+    except ImportError:
+        logger.debug("read_json_robust: charset-normalizer not available, using fallback chain")
+    except Exception as exc:
+        logger.debug("read_json_robust: charset-normalizer error (%s), using fallback chain", exc)
+
+    # Pass 2 — explicit fallback chain
+    if text is None:
+        for enc in _ENCODING_FALLBACKS:
+            try:
+                text = raw.decode(enc)
+                detected_enc = enc
+                logger.debug("read_json_robust: %s decoded with fallback %s", path, enc)
+                break
+            except (UnicodeDecodeError, LookupError):
+                continue
+
+    # Pass 3 — unconditional latin-1 with replacement (can never fail)
+    if text is None:
+        text = raw.decode("latin-1", errors="replace")
+        detected_enc = "latin-1-replace"
+        logger.warning("read_json_robust: %s — used latin-1 replace fallback", path)
+
+    # Warn when the file was not clean UTF-8 so the bad write can be hunted down
+    if detected_enc not in ("utf-8", "utf-8-sig", None):
+        logger.warning(
+            "read_json_robust: %s decoded as '%s' — "
+            "an upstream stage wrote non-UTF-8 JSON. "
+            "Check bare open() / json.dump() calls in the stage that produced this file.",
+            path, detected_enc,
+        )
+
+    return _json.loads(text)
+
+
+def write_json_utf8(path: str, data, indent: int = 2) -> None:
+    """
+    Write data to a JSON file with UTF-8 encoding and ensure_ascii=False.
+
+    ensure_ascii=False stores Unicode characters as real characters (e.g. ×)
+    rather than escape sequences (\\u00d7). This keeps files human-readable
+    AND prevents downstream readers from misidentifying the encoding.
+
+    If you write  json.dump(data, f, indent=2)  without ensure_ascii=False,
+    Python escapes every non-ASCII byte to \\uXXXX which is safe but makes
+    the files larger and harder to inspect. More importantly, some third-party
+    tools (older boto3 versions, some AWS SDK internals) may then decode the
+    \\uXXXX escapes using the system default encoding instead of UTF-8,
+    reintroducing the exact bytes that caused the decode crash.
+
+    Args:
+        path:   File path to write (str or Path).
+        data:   Dict or list to serialise.
+        indent: JSON indentation spaces (default 2).
+    """
+    with open(str(path), "w", encoding="utf-8") as f:
+        _json.dump(data, f, indent=indent, ensure_ascii=False)
