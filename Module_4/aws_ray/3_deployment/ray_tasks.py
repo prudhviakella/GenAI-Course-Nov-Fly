@@ -197,7 +197,7 @@ def extract_pdf(document_id: str, s3_bucket: str, s3_key: str) -> Dict:
         metadata = bounded_process_pdf(
             pdf_path=local_pdf,
             output_base_dir=local_output_base,
-            openai_client=openai_client,
+            client=openai_client,
         )
 
         # Docling writes its output under <output_base>/<pdf_stem>/
