@@ -1,94 +1,162 @@
 """
-load_embeddings_to_pinecone.py
----------------------------------
-Loads a JSON file of embeddings (produced by openai_embeddings.py or
-sentence_transformers_embeddings.py) into a Pinecone serverless index.
+===============================================================================
+load_embeddings_to_pinecone.py  -  Pinecone Vector Ingestion  v2
+===============================================================================
 
-WHAT THIS SCRIPT DOES
-----------------------
-1. Reads the JSON embedding file produced by the embedding pipeline
-2. Initialises a Pinecone client with your API key
+Author  : Prudhvi  |  Thoughtworks
+Stage   : 5 of 5  (Extract -> Chunk -> Enrich -> Embed -> Store)
+
+-------------------------------------------------------------------------------
+WHAT THIS MODULE DOES
+-------------------------------------------------------------------------------
+
+1. Reads the JSON embedding file produced by openai_embeddings.py (Stage 4)
+2. Initialises a Pinecone client
 3. Creates a serverless index if it doesn't exist (or reuses an existing one)
 4. Converts chunks into Pinecone's {id, values, metadata} vector format
 5. Upserts vectors in batches, then verifies the count
 
-PIPELINE POSITION
------------------
-  [1] Docling extraction
-  [2] Meta-enrichment (enrich_pipeline_openai.py)
-  [3] Embedding generation (openai_embeddings.py → text-embedding-3-small, 1536 dims)
-  [4] Pinecone ingestion  ← you are here
-  [5] Semantic search (search_pinecone.py)
+-------------------------------------------------------------------------------
+TWO-PASS RETRIEVAL CONTRACT  (critical metadata fields)
+-------------------------------------------------------------------------------
 
+The query layer uses two Pinecone metadata fields to decide whether to trigger
+a second-pass S3 fetch for large tables and images:
+
+  type    — 'table_offloaded' | 'image_offloaded' | absent (normal text)
+  s3_uri  — 's3://bucket/doc/tables/p3_table_1.md' | absent
+
+Query layer pattern:
+  for match in results.matches:
+      if match.metadata.get('type') == 'table_offloaded':
+          raw_table = fetch_from_s3(s3_client, match.metadata['s3_uri'])
+          # pass description + raw table to LLM for precise numeric answers
+
+  v1 BUG: both fields were missing from vector_meta — two-pass retrieval was
+  silently broken. All large tables returned only the AI description.
+
+-------------------------------------------------------------------------------
+EMBEDDING=NONE HANDLING  (Stage 4 contract)
+-------------------------------------------------------------------------------
+
+Stage 4 (openai_embeddings.py) passes chunks with empty content through with
+embedding=None rather than dropping them (silent data loss fix).
+
+This stage skips upsert for those chunks — they have no vector to store.
+The skip is logged with the correct reason rather than "no embedding field".
+
+  v1 BUG: log message said "no embedding field" even when the field was
+  present with an intentional None value from Stage 4.
+
+-------------------------------------------------------------------------------
+PIPELINE POSITION
+-------------------------------------------------------------------------------
+
+  [1] Docling extraction        (docling_bounded_extractor.py)
+  [2] Semantic chunking         (comprehensive_chunker.py)
+  [3] Enrichment                (enrich_pipeline_openai.py)
+  [4] Embedding generation      (openai_embeddings.py)
+  [5] Pinecone ingestion        <- you are here
+  [6] Semantic search / RAG     (query layer)
+
+-------------------------------------------------------------------------------
 PINECONE vs PGVECTOR
----------------------
-  pgvector  — runs inside your own PostgreSQL; free, self-hosted, no size limit
-  Pinecone  — managed cloud service; free tier (2GB / 1 index), no infra to manage
+-------------------------------------------------------------------------------
+
+  pgvector  — runs inside PostgreSQL; free, self-hosted, SQL joins
+  Pinecone  — managed cloud; free tier (2GB / 1 index), no infra to manage
 
   Both store vectors and search by cosine distance.
-  The main difference is operational: Pinecone has no server to run or tune,
-  but pgvector gives you SQL joins and full control over your data.
 
+-------------------------------------------------------------------------------
 UPSERT vs INSERT
-----------------
-Pinecone uses "upsert" not "insert" — if a vector ID already exists, it is
-overwritten. This means re-running this script on the same file is safe: it
-refreshes existing vectors and adds any new ones. No duplicate-key errors.
+-------------------------------------------------------------------------------
 
+Pinecone uses upsert — existing vector IDs are overwritten.
+Re-running on the same file is safe and idempotent. No duplicate-key errors.
+
+-------------------------------------------------------------------------------
 METADATA LIMITS
----------------
-Pinecone enforces a 40KB limit per vector's metadata. We keep text under 10KB
-and select specific fields from the enrichment metadata. Arbitrary-depth nested
-objects are not supported — metadata must be flat key-value pairs.
+-------------------------------------------------------------------------------
 
+Pinecone enforces a 40KB limit per vector's metadata.
+Text is capped at METADATA_TEXT_LIMIT (10KB) — well under the limit.
+Metadata must be flat key-value pairs; nested objects are not supported.
+
+-------------------------------------------------------------------------------
 USAGE
------
+-------------------------------------------------------------------------------
+
   export PINECONE_API_KEY=pc-...
   python load_embeddings_to_pinecone.py embeddings.json
-  python load_embeddings_to_pinecone.py embeddings.json --index-name financial-docs
-  python load_embeddings_to_pinecone.py embeddings.json --namespace q4-reports --batch-size 50
+  python load_embeddings_to_pinecone.py embeddings.json --index-name my-docs
+  python load_embeddings_to_pinecone.py embeddings.json --namespace q4-reports
 
+-------------------------------------------------------------------------------
 DEPENDENCIES
-------------
+-------------------------------------------------------------------------------
+
   pip install pinecone-client
+  from utils import read_json_robust
+
+-------------------------------------------------------------------------------
+CHANGELOG
+-------------------------------------------------------------------------------
+
+v2
+  FIX 1 - load_json handles both wrapped dict and bare-list input shapes.
+           data.get('chunks', []) returned [] for bare-list files.
+  FIX 2 - load_json validates embedding value (not just key presence).
+           chunks[0]['embedding'] could be None (Stage 4 intentional skip).
+           Now counts real embeddings upfront and warns if zero.
+  FIX 3 - s3_uri added to vector_meta in prepare_vectors().
+           Two-pass retrieval was silently broken without it.
+           Checks both chunk['s3_uri'] (Stage 2 level) and meta['s3_uri'].
+  FIX 4 - type added to vector_meta in prepare_vectors().
+           Query layer needs type='table_offloaded'/'image_offloaded' to
+           decide when to trigger two-pass S3 retrieval.
+  FIX 5 - verify() namespace lookup uses namespace or '' as key.
+           namespace=None used as dict key always returned 0 vector count.
+
+v1
+  Original release.
 """
 
 import os
 import sys
 import time
 import json
-from utils import read_json_robust
 import hashlib
 import argparse
 from pathlib import Path
+from typing import Optional
 
 from pinecone import Pinecone, ServerlessSpec
+from utils import read_json_robust
 
 
 # ---------------------------------------------------------------------------
 # Defaults
 # ---------------------------------------------------------------------------
-DEFAULT_INDEX_NAME = 'embeddings-index'
-DEFAULT_METRIC     = 'cosine'       # best for normalised text embeddings
-DEFAULT_CLOUD      = 'aws'
-DEFAULT_REGION     = 'us-east-1'   # Pinecone free tier lives here
-DEFAULT_BATCH_SIZE = 100            # Pinecone recommends 100–200 per upsert
-METADATA_TEXT_LIMIT = 10_000       # chars — well under Pinecone's 40KB per-vector limit
+DEFAULT_INDEX_NAME    = 'embeddings-index'
+DEFAULT_METRIC        = 'cosine'        # best for normalised text embeddings
+DEFAULT_CLOUD         = 'aws'
+DEFAULT_REGION        = 'us-east-1'    # Pinecone free tier lives here
+DEFAULT_BATCH_SIZE    = 100            # Pinecone recommends 100-200 per upsert
+METADATA_TEXT_LIMIT   = 10_000        # chars — well under Pinecone's 40KB limit
 
 
 # ===========================================================================
 # Pinecone Client
 # ===========================================================================
 
-def init_pinecone(api_key: str = None) -> Pinecone:
+def init_pinecone(api_key: Optional[str] = None) -> Pinecone:
     """
     Initialise the Pinecone client.
 
     API key resolution order:
-      1. --api-key CLI argument
+      1. --api-key CLI argument  (or explicit api_key= when called from ray_tasks.py)
       2. PINECONE_API_KEY environment variable
-
-    Get your key from: https://app.pinecone.io/
 
     Returns:
         Pinecone client, or sys.exit(1) if no key found.
@@ -99,6 +167,7 @@ def init_pinecone(api_key: str = None) -> Pinecone:
         print("  export PINECONE_API_KEY=pc-...  or  --api-key pc-...")
         print("  Get your key at: https://app.pinecone.io/")
         sys.exit(1)
+
     client = Pinecone(api_key=key)
     print("Pinecone client initialised.")
     return client
@@ -110,30 +179,30 @@ def init_pinecone(api_key: str = None) -> Pinecone:
 
 def load_json(path: str, override_dims: int = None) -> dict:
     """
-    Read and validate the embedding JSON file.
+    Read and validate the embedding JSON file from Stage 4.
 
-    Expected structure (produced by openai_embeddings.py):
-      {
-        "chunks": [
-          {
-            "id": "...",               ← optional; MD5 fallback applied below
-            "content": "...",          ← chunk text
-            "embedding": [0.1, ...],   ← list of floats (required)
-            "metadata": { ... }        ← enrichment metadata (optional)
-          },
-          ...
-        ]
-      }
+    FIX 1 — handles both input shapes:
+      Shape A — wrapped dict (Stage 4 save_results always writes this):
+        { "metadata": {...}, "chunks": [...] }
+        -> data['chunks']
 
-    DIMENSION AUTO-DETECTION
-    ------------------------
-    We read the length of the first chunk's embedding vector and use that as
-    the index dimension. This ensures the index is created with the right size
-    without requiring the user to remember or pass the dimension manually.
-    Use --dimensions only if you need to override (rare).
+      Shape B — bare list (defensive; in case called with raw list file):
+        [ {...}, {...}, ... ]
+        -> data itself
+
+    FIX 2 — validates embedding value, not just key presence:
+      Stage 4 intentionally sets embedding=None for chunks with empty content.
+      The old guard `if 'embedding' not in chunks[0]` would pass for these
+      chunks since the key IS present (just with a None value).
+      We now count chunks with real (non-None) embeddings upfront and warn
+      clearly if none exist before creating the index or spending API quota.
+
+    DIMENSION AUTO-DETECTION:
+      Length of the first real (non-None) embedding vector.
+      Use --dimensions only to override (rare).
 
     Args:
-        path          : path to the JSON file
+        path          : path to the Stage 4 output JSON file
         override_dims : if set, use this dimension count instead of auto-detecting
 
     Returns:
@@ -149,17 +218,47 @@ def load_json(path: str, override_dims: int = None) -> dict:
         print(f"ERROR: Invalid JSON — {e}")
         sys.exit(1)
 
-    chunks = data.get('chunks', [])
+    # FIX 1: handle both wrapped dict and bare list
+    if isinstance(data, list):
+        chunks = data
+    elif isinstance(data, dict):
+        chunks = data.get('chunks', [])
+    else:
+        print(f"ERROR: Unexpected top-level type {type(data).__name__} — expected list or dict.")
+        sys.exit(1)
+
     if not chunks:
-        print("ERROR: 'chunks' key missing or empty.")
+        print("ERROR: No chunks found — 'chunks' key missing or empty list.")
         sys.exit(1)
 
-    if 'embedding' not in chunks[0]:
-        print("ERROR: First chunk has no 'embedding' field.")
+    # FIX 2: count real embeddings — embedding=None chunks are intentional Stage 4 skips
+    real_embeddings = [
+        c for c in chunks
+        if c.get('embedding') is not None and c.get('embedding') != []
+    ]
+    skipped_count = len(chunks) - len(real_embeddings)
+
+    if not real_embeddings:
+        print(
+            f"ERROR: All {len(chunks)} chunks have embedding=None "
+            f"(Stage 4 marked them all as skipped — check Stage 3/4 output)."
+        )
         sys.exit(1)
 
-    dims = override_dims or len(chunks[0]['embedding'])
-    print(f"Loaded {len(chunks)} chunks | {dims} dimensions (auto-detected)")
+    if skipped_count:
+        print(
+            f"  NOTE: {skipped_count} chunk(s) have embedding=None "
+            f"(Stage 4 skips) — will not be upserted."
+        )
+
+    # Auto-detect dimensions from first real embedding
+    dims = override_dims or len(real_embeddings[0]['embedding'])
+    print(
+        f"Loaded {len(chunks)} chunks total | "
+        f"{len(real_embeddings)} with embeddings | "
+        f"{skipped_count} skipped | "
+        f"{dims} dimensions (auto-detected)"
+    )
     return {'chunks': chunks, 'dimensions': dims, 'stats': data.get('stats', {})}
 
 
@@ -167,39 +266,38 @@ def load_json(path: str, override_dims: int = None) -> dict:
 # Index Setup
 # ===========================================================================
 
-def create_or_get_index(pc: Pinecone, index_name: str, dimensions: int,
-                         metric: str, cloud: str, region: str):
+def create_or_get_index(
+    pc: Pinecone,
+    index_name: str,
+    dimensions: int,
+    metric: str,
+    cloud: str,
+    region: str,
+):
     """
     Return a ready Pinecone index — create it if it doesn't exist.
 
-    SERVERLESS vs POD-BASED
-    -----------------------
-    Pinecone offers two index types:
+    SERVERLESS vs POD-BASED:
       Serverless  — scales automatically, pay per query; free tier available
       Pod-based   — dedicated infrastructure, predictable latency
+    We default to Serverless (ServerlessSpec) — simpler and free-tier-eligible.
 
-    We default to Serverless (ServerlessSpec) because it's simpler, cheaper
-    for small datasets, and the free tier supports one serverless index.
+    IDEMPOTENT CREATION:
+      Same name + same dims -> reuse (upsert refreshes vectors).
+      Same name + different dims -> sys.exit(1) with clear message.
+      Pinecone index dimensions cannot be changed after creation.
 
-    IDEMPOTENT CREATION
-    -------------------
-    We check existing indexes first. If one with the same name already exists:
-      - Same dimension: reuse it (upsert will refresh vectors)
-      - Different dimension: fail with a clear message — you can't change
-        dimensions on an existing index without recreating it
-
-    READINESS WAIT
-    --------------
-    Pinecone index creation is asynchronous. We poll describe_index() until
-    status.ready == True before returning. Typically takes 5–30 seconds.
+    READINESS POLL:
+      Creation is asynchronous — we poll describe_index() until ready.
+      Typically 5-30 seconds.
 
     Args:
         pc         : initialised Pinecone client
         index_name : name of the index to create or reuse
-        dimensions : vector dimension count (must match embedding model output)
-        metric     : distance metric — 'cosine' for text embeddings
+        dimensions : vector dimension count (must match embedding model)
+        metric     : distance metric ('cosine' for text embeddings)
         cloud      : cloud provider ('aws', 'gcp', 'azure')
-        region     : cloud region (must be supported by free tier for aws)
+        region     : cloud region
 
     Returns:
         Pinecone Index object, ready for upsert.
@@ -207,30 +305,40 @@ def create_or_get_index(pc: Pinecone, index_name: str, dimensions: int,
     existing = [idx['name'] for idx in pc.list_indexes()]
 
     if index_name in existing:
-        info = pc.describe_index(index_name)
+        info          = pc.describe_index(index_name)
         existing_dims = info['dimension']
 
         if existing_dims != dimensions:
-            print(f"ERROR: Index '{index_name}' exists with {existing_dims} dims "
-                  f"but file has {dimensions} dims.")
-            print(f"  Fix: use --index-name a-new-name  OR  delete the index in the Pinecone console.")
+            print(
+                f"ERROR: Index '{index_name}' exists with {existing_dims} dims "
+                f"but file has {dimensions} dims."
+            )
+            print(
+                "  Fix: --index-name a-new-name  "
+                "OR  delete the index in the Pinecone console."
+            )
             sys.exit(1)
 
         index = pc.Index(index_name)
         stats = index.describe_index_stats()
-        print(f"Reusing index '{index_name}' | {stats['total_vector_count']} vectors already present")
+        print(
+            f"Reusing index '{index_name}' | "
+            f"{stats['total_vector_count']} vectors already present"
+        )
         return index
 
     # Create new index
-    print(f"Creating index '{index_name}' | {dimensions} dims | {metric} | {cloud}/{region}...")
+    print(
+        f"Creating index '{index_name}' | "
+        f"{dimensions} dims | {metric} | {cloud}/{region}..."
+    )
     pc.create_index(
         name=index_name,
         dimension=dimensions,
         metric=metric,
-        spec=ServerlessSpec(cloud=cloud, region=region)
+        spec=ServerlessSpec(cloud=cloud, region=region),
     )
 
-    # Poll until ready — creation is asynchronous
     print("Waiting for index to become ready...", end='', flush=True)
     while True:
         status = pc.describe_index(index_name).get('status', {})
@@ -251,76 +359,115 @@ def prepare_vectors(chunks: list, namespace: str = None) -> list:
     """
     Convert chunk dicts into Pinecone's upsert format.
 
-    PINECONE VECTOR FORMAT
-    ----------------------
-    Each vector must be:
-      {
-        "id":       str,            ← unique string ID
-        "values":   list[float],    ← the embedding
-        "metadata": dict            ← flat key-value pairs only
-      }
+    PINECONE VECTOR FORMAT:
+      { "id": str, "values": list[float], "metadata": dict }
+      Metadata must be flat key-value pairs — no nested objects or lists of dicts.
 
-    Nested dicts and lists of objects are not supported in Pinecone metadata.
-    We flatten the enrichment metadata into scalar fields.
+    ID FALLBACK:
+      chunk['id'] -> chunk['chunk_id'] -> MD5 hash of content text.
+      MD5 is deterministic — same content always produces the same ID,
+      so repeated upserts remain idempotent.
 
-    ID FALLBACK
-    -----------
-    If a chunk has no 'id' or 'chunk_id', we generate a deterministic ID
-    from the MD5 hash of the content text. This matches the fallback used in
-    load_embeddings_to_pgvector.py — same input always produces the same ID,
-    so upserts remain idempotent.
+    FIX 3 — s3_uri added to vector_meta:
+      Stage 2 writes s3_uri directly on the chunk dict (not inside metadata):
+        chunk['s3_uri'] = 's3://bucket/doc/tables/p3_table_1.md'
+      Stage 4 passes it through unchanged.
+      We check both chunk['s3_uri'] and chunk['metadata']['s3_uri'].
+      Without this, the query layer cannot fetch raw Markdown for large tables
+      (two-pass retrieval pattern is silently broken).
 
-    METADATA FIELDS INCLUDED
-    ------------------------
-    We include a curated subset of the enrichment metadata:
-      text        — truncated chunk content (for display in search results)
-      source      — document filename or path
-      page        — page number (int)
-      breadcrumbs — section heading path
-      key_phrases — comma-joined list (Pinecone requires scalar, not list)
-      char_count  — length of original chunk text
-      pii_redacted — whether PII was scrubbed
+    FIX 4 — type added to vector_meta:
+      Stage 3 writes chunk['metadata']['type'] = 'table_offloaded' or
+      'image_offloaded' for offloaded assets.
+      The query layer needs this to decide whether to trigger two-pass S3 fetch:
+        if match.metadata.get('type') == 'table_offloaded':
+            raw_table = fetch_from_s3(s3_client, match.metadata['s3_uri'])
 
-    We deliberately omit:
-      embedding  — already stored as 'values', no need to duplicate in metadata
-      entities   — nested dict, not supported
+    METADATA FIELDS INCLUDED:
+      text            — truncated chunk content (shown in search results)
+      type            — 'table_offloaded' / 'image_offloaded' / absent
+      s3_uri          — S3 pointer for two-pass retrieval
+      source          — document filename or path
+      page            — page number (int)
+      breadcrumbs     — section heading path (e.g. "Results > Efficacy")
+      char_count      — original chunk text length
+      pii_redacted    — whether PII was scrubbed by Stage 3
+      key_phrases     — comma-joined top phrases from Stage 3
+      num_atomic_chunks — number of Docling elements merged into this chunk
+
+    METADATA FIELDS OMITTED:
+      embedding       — stored as 'values', duplicating in metadata wastes space
+      entities        — nested dict, not supported by Pinecone metadata
       monetary_values — redundant with content text
 
+    NOTE on key_phrases:
+      Stored as a comma-joined string for compatibility.
+      Pinecone does support list values for $in filter queries — upgrade to
+      list storage if metadata filtering on key_phrases is needed:
+        filter={'key_phrases': {'$in': ['hazard ratio']}}
+
     Args:
-        chunks    : list of chunk dicts from the JSON file
-        namespace : informational only (used in log line); not embedded in vector
+        chunks    : list of chunk dicts from load_json()
+        namespace : informational only; logged in output, not stored in vector
 
     Returns:
-        List of vector dicts ready for pc.Index.upsert().
+        List of {id, values, metadata} dicts ready for index.upsert().
     """
-    print(f"Preparing {len(chunks)} vectors{' for namespace: ' + namespace if namespace else ''}...")
+    print(
+        f"Preparing vectors"
+        f"{' for namespace: ' + namespace if namespace else ''}..."
+    )
 
     vectors = []
     skipped = 0
 
     for chunk in chunks:
-        # --- ID resolution ---
-        text = chunk.get('content') or chunk.get('content_only') or chunk.get('text', '')
+        # ── ID resolution ─────────────────────────────────────────────────
+        text     = chunk.get('content') or chunk.get('content_only') or chunk.get('text', '')
         chunk_id = (
             chunk.get('id')
             or chunk.get('chunk_id')
             or 'chunk_' + hashlib.md5(text.encode()).hexdigest()[:16]
         )
 
-        # --- Embedding ---
+        # ── Embedding ─────────────────────────────────────────────────────
+        # embedding=None means Stage 4 intentionally skipped this chunk
+        # (empty content — e.g. Stage 1 AI description failed for an asset).
+        # Do NOT upsert — no vector to store.
         embedding = chunk.get('embedding')
+        if embedding is None:
+            print(
+                f"  SKIP {chunk_id}: embedding=None "
+                f"(Stage 4 marked as skipped — empty or unavailable content)"
+            )
+            skipped += 1
+            continue
         if not embedding:
-            print(f"  SKIP {chunk_id}: no embedding field")
+            # Empty list [] — should not happen normally, treat same as None
+            print(f"  SKIP {chunk_id}: embedding is empty list")
             skipped += 1
             continue
 
-        # --- Metadata (flat scalars only) ---
-        meta = chunk.get('metadata') or {}
+        # ── Metadata (flat scalars only) ───────────────────────────────────
+        meta        = chunk.get('metadata') or {}
         vector_meta = {}
 
         # Text content — truncated to stay under 40KB Pinecone metadata limit
         if text:
             vector_meta['text'] = text[:METADATA_TEXT_LIMIT]
+
+        # FIX 4: chunk type — query layer needs this to trigger two-pass retrieval
+        # Stage 3 writes type='table_offloaded' / 'image_offloaded' in metadata.
+        chunk_type = meta.get('type') or meta.get('chunk_type')
+        if chunk_type:
+            vector_meta['type'] = str(chunk_type)
+
+        # FIX 3: s3_uri — essential for two-pass retrieval of large tables/images.
+        # Stage 2 writes s3_uri at chunk level (not inside metadata dict).
+        # Also check meta['s3_uri'] as defensive fallback.
+        s3_uri = chunk.get('s3_uri') or meta.get('s3_uri')
+        if s3_uri:
+            vector_meta['s3_uri'] = str(s3_uri)
 
         # Source document provenance
         if 'source'       in meta: vector_meta['source']       = str(meta['source'])
@@ -329,21 +476,25 @@ def prepare_vectors(chunks: list, namespace: str = None) -> list:
         if 'char_count'   in meta: vector_meta['char_count']   = int(meta['char_count'])
         if 'pii_redacted' in meta: vector_meta['pii_redacted'] = bool(meta['pii_redacted'])
 
-        # key_phrases: list → comma-joined string (Pinecone requires scalar metadata)
+        # key_phrases: list -> comma-joined string (Pinecone requires scalar values)
         if 'key_phrases' in meta:
-            vector_meta['key_phrases'] = ', '.join(meta['key_phrases'][:10])
+            kp = meta['key_phrases']
+            if isinstance(kp, list):
+                vector_meta['key_phrases'] = ', '.join(str(p) for p in kp[:10])
+            elif isinstance(kp, str):
+                vector_meta['key_phrases'] = kp
 
-        # num_atomic_chunks: useful for scoring chunk density
+        # Chunk density — useful for scoring
         if 'num_atomic_chunks' in meta:
             vector_meta['num_atomic_chunks'] = int(meta['num_atomic_chunks'])
 
         vectors.append({
             "id":       chunk_id,
             "values":   embedding,
-            "metadata": vector_meta
+            "metadata": vector_meta,
         })
 
-    print(f"Prepared {len(vectors)} vectors | {skipped} skipped (no embedding)")
+    print(f"Prepared {len(vectors)} vectors | {skipped} skipped (embedding=None)")
     return vectors
 
 
@@ -351,36 +502,29 @@ def prepare_vectors(chunks: list, namespace: str = None) -> list:
 # Upsert
 # ===========================================================================
 
-def upsert_vectors(index, vectors: list, namespace: str = None,
-                   batch_size: int = DEFAULT_BATCH_SIZE) -> int:
+def upsert_vectors(
+    index,
+    vectors: list,
+    namespace: Optional[str] = None,
+    batch_size: int = DEFAULT_BATCH_SIZE,
+) -> int:
     """
     Upsert vectors into Pinecone in batches.
 
-    WHY UPSERT (not insert)?
-    ------------------------
-    Pinecone only supports upsert — if a vector ID already exists, it is
-    overwritten with the new values. This makes the script fully idempotent:
-    running it twice on the same file is safe and has the same outcome as
-    running it once. No duplicate-key errors, no manual deduplication needed.
+    WHY UPSERT?
+      Pinecone only supports upsert. Existing vector IDs are overwritten.
+      Re-running on the same file is fully idempotent — no deduplication needed.
 
-    WHY BATCH?
-    ----------
-    The Pinecone SDK's upsert() has a payload size limit. Batching at 100
-    vectors (the recommended default) keeps each request well under the limit
-    and makes progress visible. For high-throughput scenarios, increase to 200.
-
-    NAMESPACE
-    ---------
-    Namespaces are logical partitions within an index. Vectors in different
-    namespaces are isolated — a query in namespace "q1-reports" never touches
-    "q2-reports". Use namespaces to organise documents without creating
-    separate indexes (which would each consume your index quota).
+    NAMESPACE:
+      Logical partition within an index. Vectors in different namespaces are
+      isolated — a query in 'q1-reports' never touches 'q2-reports'. Use
+      namespaces to organise documents without consuming additional index quota.
 
     Args:
         index      : Pinecone Index object from create_or_get_index()
         vectors    : list of {id, values, metadata} dicts
-        namespace  : target namespace (empty string = default namespace)
-        batch_size : vectors per upsert call
+        namespace  : target namespace (None or '' = default namespace)
+        batch_size : vectors per upsert call (100-200 recommended)
 
     Returns:
         Total vectors upserted.
@@ -390,11 +534,11 @@ def upsert_vectors(index, vectors: list, namespace: str = None,
     start    = time.time()
 
     for i in range(0, total, batch_size):
-        batch = vectors[i : i + batch_size]
+        batch     = vectors[i:i + batch_size]
         index.upsert(vectors=batch, namespace=namespace or "")
         uploaded += len(batch)
-        elapsed = time.time() - start
-        rate    = uploaded / elapsed if elapsed > 0 else 0
+        elapsed   = time.time() - start
+        rate      = uploaded / elapsed if elapsed > 0 else 0
         print(f"  Upserted {uploaded}/{total} | {rate:.0f} vectors/s")
 
     elapsed = time.time() - start
@@ -406,27 +550,34 @@ def upsert_vectors(index, vectors: list, namespace: str = None,
 # Verification
 # ===========================================================================
 
-def verify(index, expected: int, namespace: str = None):
+def verify(index, expected: int, namespace: Optional[str] = None):
     """
     Check that the index contains the expected number of vectors.
 
-    ASYNC STATS NOTE
-    ----------------
-    Pinecone updates index statistics asynchronously — describe_index_stats()
-    may lag by a few seconds after a large upsert. If the count doesn't match
-    immediately, this is usually a timing issue rather than data loss.
-    We print a soft warning rather than failing, since the data is almost
-    certainly there.
+    FIX 5 — namespace dict key uses namespace or '':
+      Pinecone stats['namespaces'] keys the default namespace as '' (empty string).
+      The old code used namespace directly as the dict key — when namespace=None
+      this looked up key None which never matches, always returning count=0.
+
+    ASYNC STATS NOTE:
+      Pinecone updates index statistics asynchronously. describe_index_stats()
+      may lag a few seconds after a large upsert. We print a soft warning rather
+      than failing — the data is almost certainly present.
 
     Args:
-        index    : Pinecone Index object
-        expected : number of vectors we upserted
-        namespace: namespace to check (None = check total)
+        index     : Pinecone Index object
+        expected  : number of vectors upserted (len(vectors) from prepare_vectors)
+        namespace : namespace to check (None = check total index count)
     """
     stats = index.describe_index_stats()
 
     if namespace:
-        actual = stats.get('namespaces', {}).get(namespace, {}).get('vector_count', 0)
+        # FIX 5: use namespace or '' — Pinecone keys the default namespace as ''
+        actual = (
+            stats.get('namespaces', {})
+                 .get(namespace or '', {})
+                 .get('vector_count', 0)
+        )
         print(f"Namespace '{namespace}': {actual} vectors (expected {expected})")
     else:
         actual = stats['total_vector_count']
@@ -435,8 +586,10 @@ def verify(index, expected: int, namespace: str = None):
     if actual == expected:
         print("Verification passed.")
     else:
-        print(f"WARNING: Count mismatch — Pinecone stats update asynchronously, "
-              f"wait a few seconds and recheck.")
+        print(
+            f"WARNING: Count mismatch ({actual} vs {expected}) — "
+            f"Pinecone stats update asynchronously, wait a few seconds and recheck."
+        )
 
     print(f"Index dimensions: {stats['dimension']}")
 
@@ -453,35 +606,40 @@ def verify(index, expected: int, namespace: str = None):
 def run_pipeline(args):
     """
     Orchestrate the full load pipeline:
-      init client → load file → create/get index → prepare → upsert → verify
+      init client -> load file -> create/get index -> prepare -> upsert -> verify
+
+    Called by ray_tasks.py Stage 5 or directly via CLI.
     """
     # 1. Pinecone client
-    pc = init_pinecone(args.api_key)
+    pc = init_pinecone(getattr(args, 'api_key', None))
 
-    # 2. Load JSON
-    data = load_json(args.json_file, args.dimensions)
+    # 2. Load JSON — handles both dict and bare-list input shapes
+    data = load_json(args.json_file, getattr(args, 'dimensions', None))
 
     # 3. Create or reuse index
     index = create_or_get_index(
         pc, args.index_name, data['dimensions'],
-        args.metric, args.cloud, args.region
+        args.metric, args.cloud, args.region,
     )
 
-    # 4. Prepare vectors
-    vectors = prepare_vectors(data['chunks'], args.namespace)
+    # 4. Prepare vectors — skips embedding=None, adds type + s3_uri
+    vectors = prepare_vectors(data['chunks'], getattr(args, 'namespace', None))
     if not vectors:
-        print("ERROR: No vectors prepared — check your JSON file.")
+        print(
+            "ERROR: No vectors prepared — all chunks have embedding=None. "
+            "Check Stage 3/4 pipeline output."
+        )
         sys.exit(1)
 
     # 5. Upsert
-    upsert_vectors(index, vectors, args.namespace, args.batch_size)
+    upsert_vectors(index, vectors, getattr(args, 'namespace', None), args.batch_size)
 
     # 6. Verify (give Pinecone a moment to update stats)
     time.sleep(2)
-    verify(index, len(vectors), args.namespace)
+    verify(index, len(vectors), getattr(args, 'namespace', None))
 
     print(f"\nDone. {len(vectors)} vectors loaded into '{args.index_name}'.")
-    print(f"Console: https://app.pinecone.io/")
+    print("Console: https://app.pinecone.io/")
 
 
 # ===========================================================================
@@ -490,35 +648,44 @@ def run_pipeline(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Load JSON embeddings into a Pinecone serverless index",
+        description="Load JSON embeddings into a Pinecone serverless index  (Stage 5)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
   export PINECONE_API_KEY=pc-...
 
   python load_embeddings_to_pinecone.py embeddings.json
-  python load_embeddings_to_pinecone.py embeddings.json --index-name financial-docs
+  python load_embeddings_to_pinecone.py embeddings.json --index-name my-docs
   python load_embeddings_to_pinecone.py embeddings.json --namespace q4-reports
-  python load_embeddings_to_pinecone.py embeddings.json --dimensions 384 --metric cosine
   python load_embeddings_to_pinecone.py embeddings.json --cloud gcp --region us-central1
-        """
+  python load_embeddings_to_pinecone.py embeddings.json --dimensions 384 --batch-size 200
+
+Two-pass retrieval (query layer must implement):
+  for match in results.matches:
+      if match.metadata.get('type') == 'table_offloaded':
+          raw_table = fetch_from_s3(s3_client, match.metadata['s3_uri'])
+          # pass description + raw table to LLM
+        """,
     )
 
-    parser.add_argument('json_file', help='Path to JSON file with embeddings')
-    parser.add_argument('--api-key',    default=None, help="Pinecone API key (default: PINECONE_API_KEY env var)")
-    parser.add_argument('--index-name', default=DEFAULT_INDEX_NAME, help=f"Index name (default: {DEFAULT_INDEX_NAME})")
-    parser.add_argument('--namespace',  default=None, help="Namespace for logical partitioning (optional)")
-    parser.add_argument('--dimensions', type=int, default=None,
+    parser.add_argument('json_file',     help="Path to JSON file with embeddings (Stage 4 output)")
+    parser.add_argument('--api-key',     default=None,
+                        help="Pinecone API key (default: PINECONE_API_KEY env var)")
+    parser.add_argument('--index-name',  default=DEFAULT_INDEX_NAME,
+                        help=f"Index name (default: {DEFAULT_INDEX_NAME})")
+    parser.add_argument('--namespace',   default=None,
+                        help="Namespace for logical partitioning (optional)")
+    parser.add_argument('--dimensions',  type=int, default=None,
                         help="Vector dimensions — auto-detected from first chunk if not set")
-    parser.add_argument('--metric', default=DEFAULT_METRIC,
+    parser.add_argument('--metric',      default=DEFAULT_METRIC,
                         choices=['cosine', 'euclidean', 'dotproduct'],
                         help=f"Distance metric (default: {DEFAULT_METRIC})")
-    parser.add_argument('--cloud',  default=DEFAULT_CLOUD,
+    parser.add_argument('--cloud',       default=DEFAULT_CLOUD,
                         choices=['aws', 'gcp', 'azure'],
                         help=f"Cloud provider (default: {DEFAULT_CLOUD})")
-    parser.add_argument('--region', default=DEFAULT_REGION,
+    parser.add_argument('--region',      default=DEFAULT_REGION,
                         help=f"Cloud region (default: {DEFAULT_REGION})")
-    parser.add_argument('--batch-size', type=int, default=DEFAULT_BATCH_SIZE,
+    parser.add_argument('--batch-size',  type=int, default=DEFAULT_BATCH_SIZE,
                         help=f"Vectors per upsert batch (default: {DEFAULT_BATCH_SIZE})")
 
     run_pipeline(parser.parse_args())
