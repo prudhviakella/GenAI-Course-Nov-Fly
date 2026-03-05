@@ -1,170 +1,166 @@
 """
 RAGBench (HotpotQA) Dataset Loader for RAG Evaluation
 -----------------------------------------------------
-This script does 3 main things:
+Produces two files:
+  1. golden_hotpotqa_30.jsonl   — 30 examples for evaluation (questions + gold answers + contexts)
+  2. rag_corpus_hotpotqa_500.jsonl — 500 document chunks to populate Pinecone
 
-1. Loads the RAGBench 'hotpotqa' dataset from Hugging Face.
-2. Extracts the first 30 samples as a "Golden Dataset" — used to evaluate RAG pipelines.
-3. Extracts the first 500 samples as a "Corpus Dataset" — used to populate a Vector DB (e.g. Pinecone).
-
-Each corpus document is flattened and written with metadata (question, reference answer, etc.)
-so it can be later embedded and retrieved.
+Run:
+  pip install datasets
+  python 1_prepare_dataset.py
 """
 
-import os
 import json
 import logging
 from pathlib import Path
-from datasets import load_dataset
 from typing import List, Optional
 
-# ============ Logging Configuration ============
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-)
-logger = logging.getLogger("ragbench_loader")
+# pip install datasets
+from datasets import load_dataset
 
-# ============ Configuration ============
-DS_NAME = "rungalileo/ragbench"  # Hugging Face dataset repo name
-CONFIG = "hotpotqa"              # Specific RAGBench subset
-SPLIT = "train"                  # We use train split for both corpus and golden
+# ── Logging ──────────────────────────────────────────────────────────────────
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+log = logging.getLogger("ragbench_loader")
 
-OUT_DIR = Path("ragbench_hotpotqa_exports")  # Output folder for files
+# ── Config ───────────────────────────────────────────────────────────────────
+DS_NAME    = "rungalileo/ragbench"
+CONFIG     = "hotpotqa"
+SPLIT      = "train"
+GOLDEN_N   = 30
+CORPUS_N   = 500
+MAX_CHARS  = 8_000
+
+OUT_DIR    = Path("ragbench_hotpotqa_exports")
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-GOLDEN_PATH = OUT_DIR / "golden_hotpotqa_30.jsonl"   # Golden evaluation dataset file
-CORPUS_PATH = OUT_DIR / "rag_corpus_hotpotqa_500.jsonl"  # Corpus dataset file for Pinecone
+GOLDEN_PATH = OUT_DIR / "golden_hotpotqa_30.jsonl"
+CORPUS_PATH = OUT_DIR / "rag_corpus_hotpotqa_500.jsonl"
 
-# ===========================================================
-# Helper Functions
-# ===========================================================
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def as_text_list(documents: Optional[List], documents_sentences: Optional[List] = None) -> List[str]:
     """
-    Normalize the 'documents' field from the dataset into a list of plain text strings.
+    Normalise the 'documents' field into a plain list[str].
 
-    Each RAGBench example includes 'documents' and sometimes 'documents_sentences'.
-    These can appear in different shapes:
-      - list[str]
-      - list[dict] containing keys like 'text', 'content', etc.
-      - list[list[str]] in 'documents_sentences' (each sentence as a string)
-
-    This function ensures we always return a clean list[str] for downstream use.
+    RAGBench shapes we handle:
+      • list[str]           — already plain text
+      • list[dict]          — dicts with 'text'/'content'/… keys or a 'sentences' list
+      • list[list[str]]     — sentences grouped by document (FIX: was silently dropped before)
+      • fallback to documents_sentences if nothing else works
     """
-    if documents is None:
+    if not documents:                           # None or empty list → skip
         return []
 
-    # Case 1: Already a list of strings
-    if documents and isinstance(documents[0], str):
-        return documents
+    first = documents[0]
 
-    # Case 2: list of dicts with possible keys
-    candidate_keys = ("text", "content", "page_content", "body")
-    out = []
-    if documents and isinstance(documents[0], dict):
+    # Case A: already plain strings
+    if isinstance(first, str):
+        return [d for d in documents if isinstance(d, str) and d.strip()]
+
+    # Case B: list of lists of strings (e.g. sentences per doc)  ← BUG FIX
+    if isinstance(first, list):
+        return [
+            " ".join(s for s in doc if isinstance(s, str) and s.strip())
+            for doc in documents
+            if isinstance(doc, list)
+        ]
+
+    # Case C: list of dicts
+    if isinstance(first, dict):
+        candidate_keys = ("text", "content", "page_content", "body")
+        out = []
         for d in documents:
-            txt = None
-            for k in candidate_keys:
-                if k in d and isinstance(d[k], str) and d[k].strip():
-                    txt = d[k].strip()
-                    break
-            # Some dicts have a 'sentences' list instead
-            if txt is None and "sentences" in d and isinstance(d["sentences"], list):
-                txt = " ".join(s for s in d["sentences"] if isinstance(s, str))
+            if not isinstance(d, dict):
+                continue
+            # Try well-known text keys first
+            txt = next((d[k].strip() for k in candidate_keys if k in d and isinstance(d[k], str) and d[k].strip()), None)
+            # Fallback: 'sentences' list inside the dict
+            if txt is None and isinstance(d.get("sentences"), list):
+                txt = " ".join(s for s in d["sentences"] if isinstance(s, str) and s.strip())
             if txt:
                 out.append(txt)
         if out:
             return out
 
-    # Case 3: Fallback to documents_sentences (list of list of str)
+    # Case D: documents_sentences as last resort
     if documents_sentences and isinstance(documents_sentences, list):
-        joined = []
-        for doc_sents in documents_sentences:
-            if isinstance(doc_sents, list):
-                joined.append(" ".join(s for s in doc_sents if isinstance(s, str)))
-        return joined
+        return [
+            " ".join(s for s in sents if isinstance(s, str) and s.strip())
+            for sents in documents_sentences
+            if isinstance(sents, list)
+        ]
 
     return []
 
-def trunc(s: str, max_chars: int = 8000) -> str:
-    """Truncate any long text to avoid massive files (e.g., large documents)."""
-    return s if len(s) <= max_chars else s[:max_chars]
+
+def trunc(s: str, max_chars: int = MAX_CHARS) -> str:
+    return s[:max_chars] if len(s) > max_chars else s
 
 
-# ===========================================================
-# Step 1: Load Dataset from Hugging Face
-# ===========================================================
-logger.info(f"Loading dataset '{DS_NAME}' (config='{CONFIG}', split='{SPLIT}')...")
+def make_id(row: dict, idx: int) -> str:
+    """Return a stable string ID — fallback to row index if the field is missing."""
+    raw = row.get("id")
+    if raw is not None:
+        return str(raw)
+    # FIX: original code silently stored None when 'id' was absent
+    return f"row_{idx}"
+
+
+# ── Load dataset ──────────────────────────────────────────────────────────────
+log.info(f"Loading '{DS_NAME}' config='{CONFIG}' split='{SPLIT}' ...")
 ds = load_dataset(DS_NAME, CONFIG, split=SPLIT)
-logger.info(f"Loaded dataset with {len(ds)} rows and fields: {ds.features.keys()}")
+log.info(f"Loaded {len(ds)} rows | fields: {list(ds.features.keys())}")
 
-# ===========================================================
-# Step 2: Create GOLDEN DATASET (first 30 examples)
-# ===========================================================
-gold_n = min(30, len(ds))
-logger.info(f"Creating golden dataset using first {gold_n} examples...")
+# ── Step 1 : Golden dataset (first 30 rows) ───────────────────────────────────
+golden_n = min(GOLDEN_N, len(ds))
+log.info(f"Writing golden dataset ({golden_n} examples) → {GOLDEN_PATH}")
 
 with GOLDEN_PATH.open("w", encoding="utf-8") as f:
-    for row in ds.select(range(gold_n)):
-        q = row.get("question", "")
-        a = row.get("response", "")
-        contexts = as_text_list(row.get("documents"), row.get("documents_sentences"))
-
-        # Prepare clean JSON object
+    for i, row in enumerate(ds.select(range(golden_n))):
         item = {
-            "id": row.get("id"),
-            "input": q,                       # Model input question
-            "reference": a,                   # Ground truth answer
-            "contexts": contexts,             # Supporting documents
-            "dataset_name": row.get("dataset_name", "hotpotqa"),
-            "source": f"{DS_NAME}/{CONFIG}",
+            "id":           make_id(row, i),
+            "input":        row.get("question", ""),
+            "reference":    row.get("response", ""),
+            "contexts":     as_text_list(row.get("documents"), row.get("documents_sentences")),
+            "dataset_name": row.get("dataset_name", CONFIG),
+            "source":       f"{DS_NAME}/{CONFIG}",
         }
-
-        # Write as one JSON line
         f.write(json.dumps(item, ensure_ascii=False) + "\n")
 
-logger.info(f"Golden dataset written to: {GOLDEN_PATH.resolve()}")
+log.info(f"Golden dataset written → {GOLDEN_PATH.resolve()}")
 
-# ===========================================================
-# Step 3: Create CORPUS DATASET (first 500 examples)
-# ===========================================================
-# Corpus will overlap with golden set so we can evaluate retrieval on those examples.
-corpus_n = min(500, len(ds))
-logger.info(f"Building corpus dataset from first {corpus_n} examples (including golden overlap)...")
+# ── Step 2 : Corpus dataset (first 500 rows, flat per-doc records) ─────────────
+corpus_n = min(CORPUS_N, len(ds))
+log.info(f"Writing corpus dataset ({corpus_n} source rows) → {CORPUS_PATH}")
 
-subset = ds.select(range(corpus_n))
-
-# Collect golden IDs for marking overlap
-gold_ids = set(ds.select(range(gold_n))["id"])
+gold_ids = {make_id(row, i) for i, row in enumerate(ds.select(range(golden_n)))}
 
 with CORPUS_PATH.open("w", encoding="utf-8") as f:
-    for row in subset:
-        ex_id = row.get("id")
-        q = row.get("question", "")
-        a = row.get("response", "")
-        docs = as_text_list(row.get("documents"), row.get("documents_sentences"))
+    for i, row in enumerate(ds.select(range(corpus_n))):
+        ex_id = make_id(row, i)
+        docs  = as_text_list(row.get("documents"), row.get("documents_sentences"))
+
+        if not docs:                            # FIX: skip rows with no usable text
+            log.warning(f"Row {i} (id={ex_id}) produced no document text — skipping")
+            continue
 
         for k, doc_text in enumerate(docs):
             rec = {
-                "id": f"{ex_id}_d{k}",             # Unique ID for each document
-                "text": trunc(doc_text),           # Document text content
+                "id":   f"{ex_id}_d{k}",
+                "text": trunc(doc_text),
                 "metadata": {
-                    "example_id": ex_id,
-                    "question": trunc(q, 2000),
-                    "reference_answer": trunc(a, 2000),
-                    "dataset": "hotpotqa",
-                    "source": f"{DS_NAME}/{CONFIG}",
-                    "doc_index": k,
-                    "in_golden": ex_id in gold_ids  # Flag for overlap with evaluation set
-                }
+                    "example_id":       ex_id,
+                    "question":         trunc(row.get("question", ""), 2_000),
+                    "reference_answer": trunc(row.get("response",  ""), 2_000),
+                    "dataset":          CONFIG,
+                    "source":           f"{DS_NAME}/{CONFIG}",
+                    "doc_index":        k,
+                    "in_golden":        ex_id in gold_ids,
+                },
             }
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
-logger.info(f"Corpus dataset written to: {CORPUS_PATH.resolve()}")
-logger.info("Script completed successfully!")
-logger.info("-----------------------------------------------------------------")
-logger.info("Golden dataset  → Used for evaluation (LangSmith, RAGAS, etc.)")
-logger.info("Corpus dataset  → Used to populate vector DB (e.g., Pinecone)")
-logger.info("Overlap ensured: The 30 golden examples are included in the corpus")
-logger.info("-----------------------------------------------------------------")
+log.info(f"Corpus dataset written → {CORPUS_PATH.resolve()}")
+log.info("Done.")
+log.info("  Golden  → evaluation set  (LangSmith / MLflow / RAGAS)")
+log.info("  Corpus  → Pinecone vector store")
