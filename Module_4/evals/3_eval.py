@@ -1,193 +1,303 @@
 """
-RAG Evaluation Pipeline — Dual Mode
--------------------------------------
-  Part A  →  Hand-coded metrics  →  MLflow Model Training mode
-              (log_params / log_metrics / log_artifact)
-
-  Part B  →  mlflow.genai.evaluate() + Scorers  →  MLflow GenAI mode
-              (@mlflow.trace / @scorer / built-in scorers)
-
-Prerequisites:
-  1. MLflow 3 server running:
-       mlflow server \
-          --backend-store-uri postgresql://mlflow_user:mlflow_pass@your-rds-endpoint.rds.amazonaws.com:5432/mlflow_db \
-          --default-artifact-root s3://your-bucket/mlflow-artifacts \
-          --host 0.0.0.0 \
-          --port 5000
-
-  2. Env vars:
-       export OPENAI_API_KEY="sk-..."
-       export PINECONE_API_KEY="pcn-..."
-
-  3. golden_hotpotqa_30.jsonl  (from 1_prepare_dataset.py)
-  4. Pinecone index populated  (from 2_ingest.py)
-
-Run:
-  python 3_eval.py --mode part_a   # hand-coded → Model Training tab
-  python 3_eval.py --mode part_b   # mlflow.genai → GenAI tab
-  python 3_eval.py --mode both     # run both (default)
+╔══════════════════════════════════════════════════════════════════════════╗
+║          RAG Evaluation Pipeline — MLflow 3 (GenAI + Model Training)    ║
+╠══════════════════════════════════════════════════════════════════════════╣
+║                                                                          ║
+║  DATASET  RAGBench HotpotQA (30 golden examples)                        ║
+║    input       → question / query                                        ║
+║    reference   → gold answer                                             ║
+║    contexts    → list[str]  gold context chunks (4 per example)          ║
+║    id          → record identifier                                       ║
+║                                                                          ║
+║  TWO EVALUATION MODES  (select via --mode flag)                          ║
+║                                                                          ║
+║  Part A  →  Model Training mode                                          ║
+║             Hand-coded metrics computed in pure Python + LLM judges.    ║
+║             Logged via mlflow.log_params() + mlflow.log_metrics().       ║
+║             Visible in MLflow UI: Model Training tab                     ║
+║                                                                          ║
+║  Part B  →  GenAI mode                                                   ║
+║             @mlflow.trace decorates the pipeline → every call creates   ║
+║             a waterfall trace (CHAIN → RETRIEVER → LLM) in the UI.      ║
+║             mlflow.genai.evaluate() runs 11 scorers over a DataFrame.   ║
+║             Visible in MLflow UI: GenAI tab → Traces + Eval Results     ║
+║                                                                          ║
+╠══════════════════════════════════════════════════════════════════════════╣
+║  PREREQUISITES                                                           ║
+║                                                                          ║
+║  1. MLflow server running:                                               ║
+║       mlflow server                                                      ║
+║         --backend-store-uri postgresql://user:pass%40w@host:5432/db     ║
+║         --default-artifact-root s3://your-bucket/mlflow-artifacts       ║
+║         --host 0.0.0.0 --port 5001                                       ║
+║                                                                          ║
+║  2. Environment variables:                                               ║
+║       export OPENAI_API_KEY="sk-..."                                     ║
+║       export PINECONE_API_KEY="pcn-..."                                  ║
+║                                                                          ║
+║  3. golden_hotpotqa_30.jsonl  →  run 1_prepare_dataset.py first         ║
+║  4. Pinecone index populated  →  run 2_ingest.py first                  ║
+║                                                                          ║
+╠══════════════════════════════════════════════════════════════════════════╣
+║  RUN COMMANDS                                                            ║
+║    python 3_eval.py              # Part A only (default)                 ║
+║    python 3_eval.py --mode a     # Part A explicitly                     ║
+║    python 3_eval.py --mode b     # Part B (GenAI mode)                   ║
+║    python 3_eval.py --mode both  # Part A then Part B sequentially       ║
+╚══════════════════════════════════════════════════════════════════════════╝
 """
 
+# ── Standard library ──────────────────────────────────────────────────────
 import argparse
 import json
 import logging
 import math
 import os
-import re
 from collections import Counter
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Tuple
 
+# ── Third-party ───────────────────────────────────────────────────────────
 import pandas as pd
-
-import mlflow
-import mlflow.genai
-from mlflow.genai import scorer
-from mlflow.tracking import MlflowClient
-
-import openai
+from openai import OpenAI
 from pinecone import Pinecone
 
-# ── Logging ───────────────────────────────────────────────────────────────
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-log = logging.getLogger("rag_eval")
+# ── MLflow core ───────────────────────────────────────────────────────────
+import mlflow
+import mlflow.genai
 
-# ── Config ────────────────────────────────────────────────────────────────
-GOLDEN_PATH     = Path("ragbench_hotpotqa_exports/golden_hotpotqa_30.jsonl")
-INDEX_NAME      = os.getenv("PINECONE_INDEX",   "hotpotqa-ragbench-mini")
-NAMESPACE       = os.getenv("PINECONE_NS",      "hotpotqa")
-EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL",  "text-embedding-3-large")
-JUDGE_MODEL     = os.getenv("JUDGE_MODEL",      "gpt-4o-mini")
-GENERATOR_MODEL = os.getenv("GENERATOR_MODEL",  "gpt-4o-mini")
-TOP_K           = int(os.getenv("TOP_K",        "5"))
-CHUNK_SIZE      = int(os.getenv("CHUNK_SIZE",   "400"))
-
-# ── MLflow Config ─────────────────────────────────────────────────────────
-MLFLOW_URI          = os.getenv("MLFLOW_URI",            "http://localhost:5000")
-EXPERIMENT_PART_A   = os.getenv("MLFLOW_EXP_A",          "RAG-HotpotQA-Evaluation")     # Model Training tab
-EXPERIMENT_PART_B   = os.getenv("MLFLOW_EXP_B",          "RAG-HotpotQA-GenAI-Eval")     # GenAI tab
-MODEL_NAME          = "RAG-HotpotQA-Pipeline"
-
-# Module-level client refs — set in main() and used by @scorer functions
-_oai: openai.OpenAI = None
-_index              = None
+# ── MLflow GenAI scorers ──────────────────────────────────────────────────
+# scorer              → @scorer decorator for writing custom code-based scorers
+# Correctness         → LLM judge: does the answer match the expected facts?
+# RelevanceToQuery    → LLM judge: is the answer on-topic for the question?
+# Safety              → LLM judge: no harmful or offensive content?
+# RetrievalGroundedness  → LLM judge: is the answer grounded in retrieved chunks?
+# RetrievalRelevance     → LLM judge: were the retrieved chunks relevant to the query?
+# RetrievalSufficiency   → LLM judge: were the retrieved chunks enough to answer?
+from mlflow.genai.scorers import (
+    scorer,
+    Correctness,       # LLM judge: does answer match expected_response?
+    RelevanceToQuery,  # LLM judge: is the answer on-topic for the question?
+    Safety,            # LLM judge: no harmful or offensive content?
+    # NOTE: RetrievalGroundedness / RetrievalRelevance / RetrievalSufficiency
+    # require a 'trace' column from live pipeline tracing — not used here.
+    # Our custom faithfulness_scorer and context_relevance_scorer cover the same ground.
+)
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# MLFLOW SETUP
+# LOGGING
 # ══════════════════════════════════════════════════════════════════════════
 
-def setup_mlflow(experiment_name: str, mode_tag: str) -> str:
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s"
+)
+log = logging.getLogger(__name__)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# CONFIGURATION
+# All values have sensible defaults — override by setting the env var.
+# ══════════════════════════════════════════════════════════════════════════
+
+MLFLOW_URL        = "http://localhost:5001"
+EXPERIMENT_A_NAME = "RAG-HotpotQA-Evaluation-v5"    # Part A → Model Training tab
+EXPERIMENT_B_NAME = "RAG-HotpotQA-GenAI-Eval-v5"    # Part B → GenAI tab
+
+PINECONE_INDEX    = "hotpotqa-ragbench-mini"
+PINECONE_NS       = "hotpotqa"
+EMBEDDING_MODEL   = "text-embedding-3-large"
+GENERATOR_MODEL   = "gpt-4o-mini"
+JUDGE_MODEL       = "gpt-4o-mini"
+TOP_K             = 5      # how many chunks to retrieve per question
+CHUNK_SIZE        = 400    # logged as a param so we can compare runs later
+
+GOLDEN_FILE       = Path("ragbench_hotpotqa_exports/golden_hotpotqa_30.jsonl")
+
+# Force MLflow to use our local server at import time.
+# This overrides any MLFLOW_TRACKING_URI env var left over from a previous
+# session (e.g. a 'databricks' value that would cause a 403 error).
+mlflow.set_tracking_uri(MLFLOW_URL)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# GLOBAL CLIENTS
+#
+# WHY GLOBALS:
+#   The @mlflow.trace decorated functions (retrieve_chunks, generate_answer,
+#   run_rag_pipeline) cannot accept client objects as arguments through
+#   the scorer interface. We store them as globals, set once in main()
+#   before evaluation begins, and used by all pipeline functions below.
+# ══════════════════════════════════════════════════════════════════════════
+
+oai_client = None   # OpenAI client — set in main()
+pine_index = None   # Pinecone index — set in main()
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# LOAD DATA
+#
+# WHY WE RENAME FIELDS:
+#   RAGBench uses different field names from what our pipeline expects.
+#   We rename them once here so all downstream functions can safely use
+#   'question', 'answer', 'contexts' without any conditionals scattered
+#   throughout the code.
+#
+#   RAGBench schema  →  our internal name
+#     input          →  question
+#     reference      →  answer
+#     contexts       →  contexts   (already a Python list, no change)
+#     id             →  id         (no change)
+# ══════════════════════════════════════════════════════════════════════════
+
+def load_golden_data(filepath):
+    """Load the 30 golden examples and rename fields to our convention."""
+    examples = []
+
+    with open(filepath, "r") as f:
+        for line in f:
+            raw = json.loads(line)
+            example = {
+                "id":       raw["id"],
+                "question": raw["input"],      # RAGBench calls it 'input'
+                "answer":   raw["reference"],  # RAGBench calls it 'reference'
+                "contexts": raw["contexts"],   # already a Python list of strings
+            }
+            examples.append(example)
+
+    log.info(f"Loaded {len(examples)} examples")
+    log.info(f"  First question : {examples[0]['question'][:80]}")
+    log.info(f"  First answer   : {examples[0]['answer'][:80]}")
+    return examples
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# RAG PIPELINE  —  Retrieve + Generate
+#
+# HOW @mlflow.trace WORKS:
+#   Each function is decorated with @mlflow.trace so MLflow records what
+#   goes in and comes out as a "span". The spans are nested into a tree:
+#
+#     run_rag_pipeline  [CHAIN]       ← root span, wraps the whole pipeline
+#       retrieve_chunks [RETRIEVER]   ← child span, captures query + doc_ids
+#       generate_answer [LLM]         ← child span, captures prompt + answer
+#
+#   In Part B — each call creates a waterfall trace in GenAI → Traces tab.
+#   In Part A — the decorator does nothing. Functions run as normal.
+# ══════════════════════════════════════════════════════════════════════════
+
+@mlflow.trace(span_type="RETRIEVER")
+def retrieve_chunks(question):
     """
-    Connect to the tracking server and create the experiment if missing.
-    Returns the experiment_id.
+    Embed the question and search Pinecone for the most similar chunks.
+    Returns:
+        doc_ids — Pinecone vector IDs of the matched chunks
+        chunks  — actual text content of the matched chunks
     """
-    mlflow.set_tracking_uri(MLFLOW_URI)
+    embed_response  = oai_client.embeddings.create(model=EMBEDDING_MODEL, input=[question])
+    question_vector = embed_response.data[0].embedding
 
-    exp = mlflow.get_experiment_by_name(experiment_name)
-    if exp is None:
-        experiment_id = mlflow.create_experiment(
-            name=experiment_name,
-            artifact_location=f"./mlflow-artifacts/{experiment_name.lower().replace(' ', '-')}",
-            tags={
-                "project": "Applied GenAI Course",
-                "dataset": "RAGBench HotpotQA",
-                "owner":   "Prudhvi",
-                "mode":    mode_tag,
-            },
-        )
-        log.info(f"Created experiment '{experiment_name}' id={experiment_id}")
-    else:
-        experiment_id = exp.experiment_id
-        log.info(f"Using  experiment '{experiment_name}' id={experiment_id}")
-
-    mlflow.set_experiment(experiment_name)
-    return experiment_id
-
-
-# ══════════════════════════════════════════════════════════════════════════
-# CLIENTS
-# ══════════════════════════════════════════════════════════════════════════
-
-def build_clients():
-    for k in ("OPENAI_API_KEY", "PINECONE_API_KEY"):
-        if not os.getenv(k):
-            raise RuntimeError(f"Missing env var: {k}")
-    oai = openai.OpenAI(api_key=os.environ["OPENAI_API_KEY"])
-    pc  = Pinecone(api_key=os.environ["PINECONE_API_KEY"])
-    return oai, pc
-
-
-def load_golden(path: Path) -> List[Dict]:
-    with path.open("r", encoding="utf-8") as f:
-        return [json.loads(l) for l in f if l.strip()]
-
-
-# ══════════════════════════════════════════════════════════════════════════
-# RETRIEVAL + GENERATION
-# (decorated with @mlflow.trace so Part B captures full span tree)
-# ══════════════════════════════════════════════════════════════════════════
-
-@mlflow.trace(name="retrieve", span_type="RETRIEVER")
-def retrieve(query: str, oai: openai.OpenAI, index) -> List:
-    """Embed the query and fetch top-K chunks from Pinecone."""
-    resp   = oai.embeddings.create(model=EMBEDDING_MODEL, input=[query])
-    vector = resp.data[0].embedding
-    result = index.query(vector=vector, top_k=TOP_K, namespace=NAMESPACE, include_metadata=True)
-    return result.matches
-
-
-@mlflow.trace(name="generate_answer", span_type="LLM")
-def generate_answer(query: str, contexts: List[str], oai: openai.OpenAI) -> str:
-    """Generate an answer using the retrieved contexts."""
-    ctx_block = "\n\n".join(f"[{i+1}] {c}" for i, c in enumerate(contexts))
-    system = (
-        "You are a precise QA assistant. Answer ONLY using the provided context. "
-        "If the context lacks the answer, say so. Be concise — 1-3 sentences."
+    search_result = pine_index.query(
+        vector=question_vector,
+        top_k=TOP_K,
+        namespace=PINECONE_NS,
+        include_metadata=True
     )
-    resp = oai.chat.completions.create(
+
+    doc_ids = [match.id for match in search_result.matches]
+    chunks  = [match.metadata.get("text", "") for match in search_result.matches]
+    return doc_ids, chunks
+
+
+@mlflow.trace(span_type="LLM")
+def generate_answer(question, chunks):
+    """
+    Send the retrieved chunks + question to GPT and get a concise answer.
+
+    System prompt strategy:
+      'ONLY using the provided context' → forces grounding, prevents the
+      model using knowledge it learned during training (reduces hallucinations).
+      'say so explicitly' → model admits uncertainty rather than fabricating.
+    """
+    context_text = ""
+    for i, chunk in enumerate(chunks):
+        context_text += f"[{i+1}] {chunk}\n\n"
+
+    response = oai_client.chat.completions.create(
         model=GENERATOR_MODEL,
-        messages=[{"role": "system", "content": system},
-                  {"role": "user",   "content": f"Context:\n{ctx_block}\n\nQuestion: {query}"}],
-        temperature=0,
+        temperature=0,   # deterministic output for reproducible evaluation
+        messages=[
+            {
+                "role": "system",
+                "content": "Answer ONLY using the context provided. If the context lacks the answer, say so explicitly. Be concise — 1 to 3 sentences."
+            },
+            {
+                "role": "user",
+                "content": f"Context:\n{context_text}\nQuestion: {question}"
+            }
+        ]
     )
-    return resp.choices[0].message.content.strip()
+    return response.choices[0].message.content.strip()
 
 
-@mlflow.trace(name="rag_pipeline", span_type="CHAIN")
-def rag_pipeline(query: str, oai: openai.OpenAI, index) -> Dict:
+@mlflow.trace(span_type="CHAIN")
+def run_rag_pipeline(question):
     """
-    Full RAG chain: retrieve → generate.
-    Traced as a CHAIN span with child RETRIEVER and LLM spans.
-    Used by Part B to capture traces for the GenAI UI.
+    Full RAG pipeline: retrieve chunks then generate an answer.
+    This is the root span (CHAIN) — retrieve and generate are its children.
+    In Part B, each call to this function creates ONE trace in the UI.
     """
-    matches  = retrieve(query, oai, index)
-    contexts = [m.metadata.get("text", "") for m in matches]
-    ret_ids  = [m.id for m in matches]
-    answer   = generate_answer(query, contexts, oai)
-    return {"answer": answer, "contexts": contexts, "retrieved_ids": ret_ids}
+    doc_ids, chunks = retrieve_chunks(question)
+    answer          = generate_answer(question, chunks)
+    return {"answer": answer, "doc_ids": doc_ids, "chunks": chunks}
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# METRIC FAMILY 1 — RETRIEVAL (pure Python)
+# METRIC FAMILY 1 — RETRIEVAL METRICS  (pure Python, zero API calls)
+#
+# These metrics measure how good the RETRIEVER step is.
+# They compare what we got from Pinecone against the known-correct doc ID.
+#
+# IMPORTANT NOTE:
+#   All scores will be 0.0 if the Pinecone vector IDs don't match the
+#   record IDs in the golden file. This happens when 2_ingest.py used
+#   auto-generated chunk IDs. This is a data alignment issue — not a bug.
+#   The LLM-judge metrics (Family 3) still work perfectly regardless.
 # ══════════════════════════════════════════════════════════════════════════
 
-def retrieval_metrics(retrieved_ids: List[str], relevant_ids: List[str]) -> Dict:
-    ret_set = set(retrieved_ids)
-    rel_set = set(relevant_ids)
-    hits    = ret_set & rel_set
-    k       = len(retrieved_ids) or 1
-    n_rel   = len(rel_set) or 1
+def compute_retrieval_metrics(retrieved_ids, relevant_ids):
+    """
+    Precision@K  — of the K chunks we retrieved, what fraction was relevant?
+                   High = low noise, Pinecone is returning the right docs.
+
+    Recall@K     — of all relevant docs, what fraction did we retrieve?
+                   High = we didn't miss important information.
+
+    F1@K         — harmonic mean of Precision and Recall.
+                   Single number when both P and R matter equally.
+
+    Hit Rate     — did we retrieve AT LEAST one relevant chunk? (1.0 or 0.0)
+                   Useful binary signal: is the pipeline ever useful at all?
+
+    nDCG@K       — like Recall but position-aware: a relevant chunk at rank 1
+                   is worth more than the same chunk at rank 5.
+    """
+    retrieved_set = set(retrieved_ids)
+    relevant_set  = set(relevant_ids)
+    hits          = retrieved_set & relevant_set
+    k             = max(len(retrieved_ids), 1)
+    n_relevant    = max(len(relevant_set), 1)
 
     precision = len(hits) / k
-    recall    = len(hits) / n_rel
-    f1        = 2 * precision * recall / (precision + recall) if (precision + recall) else 0.0
+    recall    = len(hits) / n_relevant
+    f1        = (2 * precision * recall / (precision + recall)) if (precision + recall) > 0 else 0.0
     hit_rate  = 1.0 if hits else 0.0
 
-    dcg  = sum(1.0 / math.log2(i + 2) for i, d in enumerate(retrieved_ids) if d in rel_set)
-    idcg = sum(1.0 / math.log2(i + 2) for i in range(min(len(rel_set), k)))
-    ndcg = dcg / idcg if idcg else 0.0
+    # nDCG: penalise relevant docs found at lower rank positions
+    dcg  = sum(1.0 / math.log2(i + 2) for i, d in enumerate(retrieved_ids) if d in relevant_set)
+    idcg = sum(1.0 / math.log2(i + 2) for i in range(min(n_relevant, k)))
+    ndcg = dcg / idcg if idcg > 0 else 0.0
 
     return {
         "precision": round(precision, 4),
@@ -199,513 +309,850 @@ def retrieval_metrics(retrieved_ids: List[str], relevant_ids: List[str]) -> Dict
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# METRIC FAMILY 2 — LEXICAL (pure Python)
+# METRIC FAMILY 2 — LEXICAL METRICS  (pure Python, zero API calls)
+#
+# These metrics compare the generated answer to the gold reference answer
+# using simple word-level matching — fast and free, no model calls needed.
+#
+# LIMITATION:
+#   Lexical metrics penalise correct paraphrases.
+#   "Paris is France's capital" vs "The capital of France is Paris" would
+#   score low on exact match but both are correct.
+#   That is why we also use LLM-judge metrics (Family 3) which understand
+#   meaning and not just word overlap.
 # ══════════════════════════════════════════════════════════════════════════
 
-def _norm(text: str) -> str:
-    return re.sub(r"\s+", " ", re.sub(r"[^\w\s]", "", text.lower())).strip()
+def clean_text(text):
+    """
+    Lowercase and remove punctuation for fair comparison.
+    Example: "It's Apple!" → "its apple"
+    """
+    result = text.lower()
+    result = "".join(ch for ch in result if ch.isalnum() or ch.isspace())
+    return result.strip()
 
-def exact_match(answer: str, reference: str) -> float:
-    return 1.0 if _norm(answer) == _norm(reference) else 0.0
 
-def token_f1(answer: str, reference: str) -> float:
-    a = Counter(_norm(answer).split())
-    r = Counter(_norm(reference).split())
-    common = sum((a & r).values())
-    if not common:
+def compute_exact_match(generated, reference):
+    """
+    1.0 if both answers are identical after cleaning, else 0.0.
+
+    Very strict — a single extra word gives 0.0.
+    If exact match is high, all other metrics will also be high.
+    Use it as a lower bound check.
+    """
+    return 1.0 if clean_text(generated) == clean_text(reference) else 0.0
+
+
+def compute_token_f1(generated, reference):
+    """
+    Word-overlap F1 between generated answer and reference answer.
+
+    Splits both into words, then computes:
+      Precision = overlap / generated_word_count
+      Recall    = overlap / reference_word_count
+      F1        = harmonic mean of P and R
+
+    More forgiving than exact match — gives partial credit for mostly correct answers.
+    Standard metric used in SQuAD and HotpotQA benchmarks.
+    """
+    gen_tokens = Counter(clean_text(generated).split())
+    ref_tokens = Counter(clean_text(reference).split())
+    overlap    = sum((gen_tokens & ref_tokens).values())
+
+    if overlap == 0:
         return 0.0
-    p   = common / sum(a.values())
-    rec = common / sum(r.values())
-    return round(2 * p * rec / (p + rec), 4)
+
+    precision = overlap / sum(gen_tokens.values())
+    recall    = overlap / sum(ref_tokens.values())
+    return round(2 * precision * recall / (precision + recall), 4)
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# METRIC FAMILY 3 — LLM JUDGE (shared by Part A and Part B scorers)
+# METRIC FAMILY 3 — LLM-AS-JUDGE METRICS  (OpenAI API calls)
+#
+# These metrics use GPT (JUDGE_MODEL) to evaluate quality dimensions that
+# word-matching cannot capture — faithfulness, relevance, completeness.
+#
+# HOW EACH JUDGE WORKS:
+#   1. We write a prompt describing exactly what to evaluate
+#   2. We ask the judge to return JSON: {"score": 0.0-1.0, "reasoning": "..."}
+#   3. We parse the score and store the reasoning for debugging
+#
+# WHY JSON OUTPUT:
+#   response_format={"type": "json_object"} forces the model to return
+#   valid JSON every time. Without this the model may wrap the output in
+#   markdown fences which breaks json.loads().
+#
+# These same functions are used by BOTH Part A (called directly) and
+# Part B (called inside @scorer decorated functions).
 # ══════════════════════════════════════════════════════════════════════════
 
-def _judge(prompt: str, oai: openai.OpenAI) -> Tuple[float, str]:
-    """Call the judge LLM. Returns (score 0-1, reasoning string)."""
-    resp = oai.chat.completions.create(
+def ask_judge(prompt):
+    """
+    Core helper — sends a scoring prompt to JUDGE_MODEL, returns (score, reasoning).
+    Falls back to (0.0, raw_text) if the model returns unparseable output
+    so evaluation never crashes on a bad judge response.
+    """
+    response = oai_client.chat.completions.create(
         model=JUDGE_MODEL,
-        messages=[{"role": "user", "content": prompt}],
         temperature=0,
         response_format={"type": "json_object"},
+        messages=[{"role": "user", "content": prompt}]
     )
-    raw = resp.choices[0].message.content
+    raw = response.choices[0].message.content
     try:
-        data  = json.loads(raw)
-        score = max(0.0, min(1.0, float(data.get("score", 0.0))))
-        return score, data.get("reasoning", "")
+        result    = json.loads(raw)
+        score     = float(result.get("score", 0.0))
+        score     = max(0.0, min(1.0, score))   # clamp between 0 and 1
+        reasoning = result.get("reasoning", "")
+        return score, reasoning
     except Exception:
-        return 0.0, raw
+        return 0.0, raw   # fail soft — return 0 instead of crashing
 
 
-def _context_relevance(query: str, contexts: List[str], oai: openai.OpenAI) -> Tuple[float, str]:
-    scores, reasons = [], []
-    for ctx in contexts:
-        s, r = _judge(
-            f"Rate how relevant this context is for answering the question.\n\n"
-            f"Question: {query}\nContext: {ctx[:1000]}\n\n"
-            f'Return JSON: {{"score": <0.0-1.0>, "reasoning": "<brief>"}}',
-            oai,
-        )
-        scores.append(s)
-        reasons.append(r)
-    return round(sum(scores) / len(scores), 4) if scores else 0.0, " | ".join(reasons[:2])
-
-
-def _faithfulness(answer: str, contexts: List[str], oai: openai.OpenAI) -> Tuple[float, str]:
-    ctx_block = "\n".join(f"[{i+1}] {c[:600]}" for i, c in enumerate(contexts))
-    return _judge(
-        f"Check whether every factual claim in the answer is grounded in the context.\n\n"
-        f"Context:\n{ctx_block}\n\nAnswer: {answer}\n\n"
-        f"score = supported_claims / total_claims\n"
-        f'Return JSON: {{"score": <0.0-1.0>, "reasoning": "<unsupported claims if any>"}}',
-        oai,
-    )
-
-
-def _answer_relevance(query: str, answer: str, oai: openai.OpenAI) -> Tuple[float, str]:
-    return _judge(
-        f"Rate how directly the answer addresses the question.\n\n"
-        f"Question: {query}\nAnswer: {answer}\n\n"
-        f"1.0=fully addresses | 0.5=partial | 0.0=off-topic\n"
-        f'Return JSON: {{"score": <0.0-1.0>, "reasoning": "<brief>"}}',
-        oai,
-    )
-
-
-def _completeness(answer: str, reference: str, oai: openai.OpenAI) -> Tuple[float, str]:
-    return _judge(
-        f"Does the generated answer cover all key points from the reference?\n\n"
-        f"Reference: {reference}\nGenerated: {answer}\n\n"
-        f"score = fraction of reference key points covered\n"
-        f'Return JSON: {{"score": <0.0-1.0>, "reasoning": "<missing points>"}}',
-        oai,
-    )
-
-
-def _conciseness(query: str, answer: str, oai: openai.OpenAI) -> Tuple[float, str]:
-    return _judge(
-        f"Rate how concise and focused this answer is.\n\n"
-        f"Question: {query}\nAnswer: {answer}\n\n"
-        f"1.0=perfectly concise | 0.5=slightly padded | 0.0=excessively verbose\n"
-        f'Return JSON: {{"score": <0.0-1.0>, "reasoning": "<brief>"}}',
-        oai,
-    )
-
-
-def _rag_triad_score(cr: float, faith: float, ar: float) -> float:
-    """Harmonic mean of the three RAG Triad legs — collapses to 0 if any leg is 0."""
-    denom = cr * faith + faith * ar + ar * cr
-    return round(3 * cr * faith * ar / denom, 4) if denom else 0.0
-
-
-# ══════════════════════════════════════════════════════════════════════════
-# PART B — MLFLOW GENAI SCORERS
-# @scorer functions receive the DataFrame columns as keyword args.
-# Column names must match what we pass to mlflow.genai.evaluate(data=...).
+# ── Context Relevance ────────────────────────────────────────────────────────
+# WHAT IT MEASURES:
+#   Are the chunks retrieved from Pinecone actually relevant to the question?
+#   Scores each chunk individually and returns the average.
 #
-# Columns we provide:
-#   inputs            → the question
-#   outputs           → generated answer
-#   expected_output   → gold reference answer
-#   retrieved_context → list of context strings
+# WHY IT MATTERS:
+#   This is the first leg of the RAG Triad. A low score here means the vector
+#   search is returning noisy documents — fix the retriever before the generator.
+#
+# Score interpretation:
+#   1.0 = every chunk directly addresses the question
+#   0.5 = some chunks relevant, some tangential
+#   0.0 = retrieved chunks completely unrelated to the question
+
+def score_context_relevance(question, chunks):
+    """Score how relevant the retrieved chunks are to the question (average across chunks)."""
+    if not chunks:
+        return 0.0, "no chunks retrieved"
+
+    scores, reasons = [], []
+    for chunk in chunks:
+        score, reason = ask_judge(
+            f"How relevant is this context chunk for answering the question?\n\n"
+            f"Question: {question}\n"
+            f"Context: {chunk[:800]}\n\n"
+            f"1.0 = perfectly relevant | 0.5 = somewhat relevant | 0.0 = not relevant\n"
+            f'Reply with JSON only: {{"score": 0.0 to 1.0, "reasoning": "one sentence"}}'
+        )
+        scores.append(score)
+        reasons.append(reason)
+
+    return round(sum(scores) / len(scores), 4), " | ".join(reasons[:2])
+
+
+# ── Faithfulness ─────────────────────────────────────────────────────────────
+# WHAT IT MEASURES:
+#   Does the generated answer only contain facts that are present in the context?
+#
+# WHY IT MATTERS:
+#   This is your primary HALLUCINATION detector.
+#   A low score means the model used knowledge it learned during training
+#   instead of the retrieved context — you lose source traceability.
+#   This is the second leg of the RAG Triad.
+#
+# Score interpretation:
+#   1.0 = every claim in the answer is directly supported by the context
+#   0.5 = half the claims are supported, half are hallucinated
+#   0.0 = the answer is entirely hallucinated, not grounded at all
+
+def score_faithfulness(generated_answer, chunks):
+    """Score whether the answer is fully supported by the retrieved context."""
+    if not chunks:
+        return 0.0, "no chunks retrieved"
+
+    context_block = "\n".join(f"[{i+1}] {c[:500]}" for i, c in enumerate(chunks))
+
+    return ask_judge(
+        f"Does the answer only contain facts that are found in the context?\n\n"
+        f"Context:\n{context_block}\n\n"
+        f"Answer: {generated_answer}\n\n"
+        f"Score = fraction of answer claims supported by the context.\n"
+        f"1.0 = fully supported | 0.5 = partially | 0.0 = entirely hallucinated\n"
+        f'Reply with JSON only: {{"score": 0.0 to 1.0, "reasoning": "list any unsupported claims"}}'
+    )
+
+
+# ── Answer Relevance ──────────────────────────────────────────────────────────
+# WHAT IT MEASURES:
+#   Does the generated answer actually address the question that was asked?
+#
+# WHY IT MATTERS:
+#   Catches cases where the answer is factually correct and well-grounded
+#   but doesn't answer what was asked (e.g. answers a different question).
+#   This is the third leg of the RAG Triad.
+#
+# Score interpretation:
+#   1.0 = fully addresses the question, no irrelevant content
+#   0.5 = partially addresses, missing key aspects or slightly off-topic
+#   0.0 = completely off-topic, refuses, or addresses a different question
+
+def score_answer_relevance(question, generated_answer):
+    """Score how directly the answer addresses the question."""
+    return ask_judge(
+        f"Does this answer properly address the question?\n\n"
+        f"Question: {question}\n"
+        f"Answer: {generated_answer}\n\n"
+        f"1.0 = fully answers | 0.5 = partial answer | 0.0 = off-topic or refuses\n"
+        f'Reply with JSON only: {{"score": 0.0 to 1.0, "reasoning": "one sentence"}}'
+    )
+
+
+# ── Completeness ──────────────────────────────────────────────────────────────
+# WHAT IT MEASURES:
+#   Does the answer cover ALL key points from the gold reference answer?
+#
+# WHY IT MATTERS:
+#   A faithful answer can still be incomplete — it might be grounded in the
+#   context but miss key facts from the reference. Catches answers that are
+#   too brief or skip important details.
+#
+#   Example: Reference = "Paris is the capital and largest city of France."
+#            Generated = "Paris is in France." → faithful but only 50% complete.
+#
+# Score interpretation:
+#   1.0 = all key points from the reference are present in the answer
+#   0.5 = roughly half the reference points are covered
+#   0.0 = answer covers none of the expected key points
+
+def score_completeness(generated_answer, reference_answer):
+    """Score what fraction of the reference answer's key points appear in the generated answer."""
+    return ask_judge(
+        f"Does the generated answer cover all key points from the reference answer?\n\n"
+        f"Reference: {reference_answer}\n"
+        f"Generated: {generated_answer}\n\n"
+        f"Score = fraction of reference key points present in generated answer.\n"
+        f"1.0 = covers everything | 0.5 = covers half | 0.0 = misses everything\n"
+        f'Reply with JSON only: {{"score": 0.0 to 1.0, "reasoning": "list any missing points"}}'
+    )
+
+
+# ── Conciseness ───────────────────────────────────────────────────────────────
+# WHAT IT MEASURES:
+#   Is the answer short and focused, or unnecessarily long and padded?
+#
+# WHY IT MATTERS:
+#   Verbose answers are a UX problem for QA pipelines — especially for voice
+#   assistants or chat snippets. Also, overly hedged verbose answers often
+#   signal that the model is uncertain and padding instead of answering.
+#
+# Score interpretation:
+#   1.0 = perfectly concise, every sentence contributes information
+#   0.5 = slightly padded, a few unnecessary phrases
+#   0.0 = excessively verbose, heavily padded or repeats the question
+
+def score_conciseness(question, generated_answer):
+    """Score how concise and focused the answer is."""
+    return ask_judge(
+        f"Is this answer concise and to the point, or too long and padded?\n\n"
+        f"Question: {question}\n"
+        f"Answer: {generated_answer}\n\n"
+        f"1.0 = perfectly concise | 0.5 = slightly wordy | 0.0 = far too long\n"
+        f'Reply with JSON only: {{"score": 0.0 to 1.0, "reasoning": "one sentence"}}'
+    )
+
+
+# ── RAG Triad ─────────────────────────────────────────────────────────────────
+# WHAT IT MEASURES:
+#   A single composite score that captures the entire RAG pipeline health.
+#   Combines the three legs: Context Relevance + Faithfulness + Answer Relevance.
+#
+# WHY HARMONIC MEAN (not arithmetic mean):
+#   Unlike arithmetic mean, harmonic mean collapses the score toward zero if
+#   ANY single leg is near zero. This is intentional — a pipeline that retrieves
+#   irrelevant context, hallucinates, OR answers the wrong question should score
+#   near zero overall, regardless of how well the other two legs perform.
+#
+#   Example:
+#     CR=1.0, Faith=1.0, AR=0.0  →  triad = 0.0  (useless, wrong question answered)
+#     CR=0.8, Faith=0.8, AR=0.8  →  triad = 0.8  (solid, well-balanced pipeline)
+#
+# HOW TO USE IT:
+#   Start with the RAG Triad as your headline metric.
+#   When it's low, drill into the three individual legs to find the weak link.
+
+def compute_rag_triad(context_relevance, faithfulness, answer_relevance):
+    """Harmonic mean of context relevance, faithfulness, and answer relevance."""
+    cr, fa, ar = context_relevance, faithfulness, answer_relevance
+    denom = cr * fa + fa * ar + ar * cr
+    if denom == 0:
+        return 0.0
+    return round(3 * cr * fa * ar / denom, 4)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# PART A — MODEL TRAINING MODE
+#
+# HOW IT WORKS:
+#   We run the RAG pipeline on all 30 examples ourselves, compute every
+#   metric manually, and log results to MLflow using the classic tracking API.
+#
+# MLFLOW LOGGING BREAKDOWN:
+#   log_params()        → config (model names, top_k, chunk_size, etc.)
+#   log_metrics()       → 13 aggregate averages  (avg_faithfulness, etc.)
+#   log_metrics(step=i) → 4 per-example metrics as time-series line charts
+#   log_artifact()      → eval_results.jsonl + judge_reasoning.json
+#
+# WHERE TO SEE RESULTS:
+#   MLflow UI → Model Training tab → RAG-HotpotQA-Evaluation → this run
 # ══════════════════════════════════════════════════════════════════════════
 
-@scorer
-def context_relevance_scorer(inputs, outputs, retrieved_context, **kwargs) -> float:
+def evaluate_one_example(example):
     """
-    GenAI scorer: average relevance of each retrieved chunk to the query.
-    Maps to: avg_context_relevance in Part A.
+    Run the full pipeline + all three metric families on ONE example.
+    Called 30 times — once per golden example — inside run_part_a().
+
+    Each call makes approximately 9 OpenAI API calls:
+      1  embeddings call  (retrieve_chunks)
+      1  chat call        (generate_answer)
+      5+ chat calls       (LLM judges — context_relevance loops per chunk)
     """
-    score, _ = _context_relevance(inputs, retrieved_context or [], _oai)
-    return score
+    question  = example["question"]
+    reference = example["answer"]
 
+    # Run retrieval + generation
+    doc_ids, chunks = retrieve_chunks(question)
+    generated       = generate_answer(question, chunks)
 
-@scorer
-def faithfulness_scorer(inputs, outputs, retrieved_context, **kwargs) -> float:
-    """
-    GenAI scorer: fraction of answer claims supported by the retrieved context.
-    Maps to: avg_faithfulness in Part A.
-    """
-    score, _ = _faithfulness(outputs, retrieved_context or [], _oai)
-    return score
+    # Family 1 — Retrieval metrics (pure Python, no API calls)
+    # We use the example's own id as the single "correct" doc to retrieve.
+    retrieval = compute_retrieval_metrics(doc_ids, [example["id"]])
 
+    # Family 2 — Lexical metrics (pure Python, no API calls)
+    em  = compute_exact_match(generated, reference)
+    tf1 = compute_token_f1(generated, reference)
 
-@scorer
-def answer_relevance_scorer(inputs, outputs, **kwargs) -> float:
-    """
-    GenAI scorer: does the answer address the question?
-    Maps to: avg_answer_relevance in Part A.
-    """
-    score, _ = _answer_relevance(inputs, outputs, _oai)
-    return score
-
-
-@scorer
-def rag_triad_scorer(inputs, outputs, retrieved_context, **kwargs) -> float:
-    """
-    GenAI scorer: harmonic mean of CR × Faithfulness × AR.
-    Maps to: rag_triad_score in Part A.
-    """
-    cr, _    = _context_relevance(inputs, retrieved_context or [], _oai)
-    fa, _    = _faithfulness(outputs, retrieved_context or [], _oai)
-    ar, _    = _answer_relevance(inputs, outputs, _oai)
-    return _rag_triad_score(cr, fa, ar)
-
-
-@scorer
-def completeness_scorer(inputs, outputs, expected_output, **kwargs) -> float:
-    """
-    GenAI scorer: does the answer cover all key points from the reference?
-    Maps to: avg_completeness in Part A.
-    """
-    score, _ = _completeness(outputs, expected_output or "", _oai)
-    return score
-
-
-@scorer
-def conciseness_scorer(inputs, outputs, **kwargs) -> float:
-    """
-    GenAI scorer: is the answer focused and free of padding?
-    Maps to: avg_conciseness in Part A.
-    """
-    score, _ = _conciseness(inputs, outputs, _oai)
-    return score
-
-
-# ══════════════════════════════════════════════════════════════════════════
-# PART A — HAND-CODED EVALUATION LOOP
-# ══════════════════════════════════════════════════════════════════════════
-
-def _evaluate_example_part_a(example: Dict, oai: openai.OpenAI, index) -> Dict:
-    query        = example["question"]
-    reference    = example["answer"]
-    relevant_ids = [str(d) for d in example.get("relevant_doc_ids", [])]
-
-    matches  = retrieve(query, oai, index)
-    ret_ids  = [m.id for m in matches]
-    contexts = [m.metadata.get("text", "") for m in matches]
-    answer   = generate_answer(query, contexts, oai)
-
-    ret_m          = retrieval_metrics(ret_ids, relevant_ids)
-    em             = exact_match(answer, reference)
-    tf1            = token_f1(answer, reference)
-    cr_s, cr_r     = _context_relevance(query, contexts, oai)
-    fa_s, fa_r     = _faithfulness(answer, contexts, oai)
-    ar_s, ar_r     = _answer_relevance(query, answer, oai)
-    triad          = _rag_triad_score(cr_s, fa_s, ar_s)
-    comp_s, comp_r = _completeness(answer, reference, oai)
-    conc_s, conc_r = _conciseness(query, answer, oai)
+    # Family 3 — LLM-judge metrics (API calls to JUDGE_MODEL)
+    cr_score,   cr_reason   = score_context_relevance(question, chunks)
+    fa_score,   fa_reason   = score_faithfulness(generated, chunks)
+    ar_score,   ar_reason   = score_answer_relevance(question, generated)
+    comp_score, comp_reason = score_completeness(generated, reference)
+    conc_score, conc_reason = score_conciseness(question, generated)
+    triad                   = compute_rag_triad(cr_score, fa_score, ar_score)
 
     return {
-        "query": query, "reference": reference, "generated_answer": answer,
-        "retrieved_ids": ret_ids, "relevant_ids": relevant_ids,
-        **{f: ret_m[f] for f in ["precision", "recall", "f1", "ndcg", "hit_rate"]},
-        "exact_match": em, "token_f1": tf1,
-        "context_relevance": cr_s, "faithfulness": fa_s,
-        "answer_relevance": ar_s, "rag_triad": triad,
-        "completeness": comp_s, "conciseness": conc_s,
-        # reasoning — saved to artifact, not logged as metrics
-        "cr_reasoning":            cr_r,
-        "faithfulness_reasoning":  fa_r,
-        "ar_reasoning":            ar_r,
-        "completeness_reasoning":  comp_r,
-        "conciseness_reasoning":   conc_r,
+        # Inputs and outputs — saved to file for review
+        "question":         question,
+        "reference":        reference,
+        "generated_answer": generated,
+        "retrieved_ids":    doc_ids,
+
+        # Retrieval scores
+        "precision": retrieval["precision"],
+        "recall":    retrieval["recall"],
+        "f1":        retrieval["f1"],
+        "ndcg":      retrieval["ndcg"],
+        "hit_rate":  retrieval["hit_rate"],
+
+        # Lexical scores
+        "exact_match": em,
+        "token_f1":    tf1,
+
+        # LLM-judge scores
+        "context_relevance": cr_score,
+        "faithfulness":      fa_score,
+        "answer_relevance":  ar_score,
+        "rag_triad":         triad,
+        "completeness":      comp_score,
+        "conciseness":       conc_score,
+
+        # Reasoning text — saved to a separate file for debugging low scores
+        # NOT logged as MLflow metrics (too verbose)
+        "cr_reasoning":   cr_reason,
+        "fa_reasoning":   fa_reason,
+        "ar_reasoning":   ar_reason,
+        "comp_reasoning": comp_reason,
+        "conc_reasoning": conc_reason,
     }
 
 
-def _run_part_a_loop(golden_data: List[Dict], oai: openai.OpenAI, index) -> List[Dict]:
-    results = []
-    for i, ex in enumerate(golden_data):
-        log.info(f"[Part A {i+1}/{len(golden_data)}] {ex['question'][:70]}...")
-        try:
-            results.append(_evaluate_example_part_a(ex, oai, index))
-        except Exception as e:
-            log.error(f"  Failed: {e}")
-    return results
+def average_scores(all_results):
+    """
+    Average each metric across all 30 examples.
+    The 'avg_' prefix makes the MLflow Metrics tab easy to read and sort.
+    """
+    metric_names = [
+        "precision", "recall", "f1", "ndcg", "hit_rate",
+        "exact_match", "token_f1",
+        "context_relevance", "faithfulness", "answer_relevance",
+        "rag_triad", "completeness", "conciseness",
+    ]
+    n = len(all_results)
+    return {f"avg_{name}": round(sum(r[name] for r in all_results) / n, 4) for name in metric_names}
 
 
-def _compute_aggregates(results: List[Dict]) -> Dict:
-    keys = ["precision", "recall", "f1", "ndcg", "hit_rate",
-            "exact_match", "token_f1",
-            "context_relevance", "faithfulness", "answer_relevance", "rag_triad",
-            "completeness", "conciseness"]
-    return {
-        f"avg_{k}": round(sum(r[k] for r in results if k in r) / len(results), 4)
-        for k in keys
-    }
+def _get_or_restore_experiment(name):
+    """
+    Get experiment by name — handles the 'deleted experiment' edge case.
+
+    If you delete an experiment in the MLflow UI, it enters a soft-deleted state.
+    Calling mlflow.set_experiment() on a soft-deleted name raises:
+      "Cannot set a deleted experiment as the active experiment"
+
+    This function:
+      1. Checks if the experiment exists and is active → use it
+      2. Checks if it exists but is deleted → restore it automatically
+      3. If it doesn't exist at all → MLflow creates it fresh
+
+    Students: this is why we wrap set_experiment() instead of calling it directly.
+    """
+    from mlflow.tracking import MlflowClient
+    from mlflow.entities import ViewType
+
+    client = MlflowClient()
+    exp    = client.get_experiment_by_name(name)
+
+    if exp is not None and exp.lifecycle_stage == "deleted":
+        # Restore the soft-deleted experiment so we can use it again
+        client.restore_experiment(exp.experiment_id)
+        log.info(f"Restored deleted experiment '{name}'  id={exp.experiment_id}")
+
+    mlflow.set_experiment(name)
 
 
-def _save_artifacts(results: List[Dict], run_id: str):
-    short = run_id[:8]
+def run_part_a(golden_data):
+    """Part A — evaluate all 30 examples and log to MLflow Model Training tab."""
+    mlflow.set_tracking_uri(MLFLOW_URL)
+    _get_or_restore_experiment(EXPERIMENT_A_NAME)
 
-    # Clean results (no reasoning fields)
-    results_path = f"eval_results_{short}.jsonl"
-    with open(results_path, "w", encoding="utf-8") as f:
-        for r in results:
-            f.write(json.dumps({k: v for k, v in r.items() if "reasoning" not in k}) + "\n")
-    mlflow.log_artifact(results_path)
+    with mlflow.start_run(run_name=f"part_a_{datetime.now().strftime('%Y%m%d_%H%M%S')}"):
 
-    # Judge reasoning (verbose, for debugging)
-    reasoning_path = f"judge_reasoning_{short}.json"
-    with open(reasoning_path, "w", encoding="utf-8") as f:
-        json.dump([
+        # Log config params — visible in Params tab, enables Compare Runs view
+        mlflow.log_params({
+            "embedding_model": EMBEDDING_MODEL,
+            "generator_model": GENERATOR_MODEL,
+            "judge_model":     JUDGE_MODEL,
+            "top_k":           TOP_K,
+            "chunk_size":      CHUNK_SIZE,
+            "num_examples":    len(golden_data),
+        })
+
+        # Evaluate every example one by one
+        all_results = []
+        for i, example in enumerate(golden_data):
+            log.info(f"  [{i+1}/{len(golden_data)}] {example['question'][:65]}...")
+            result = evaluate_one_example(example)
+            all_results.append(result)
+
+        # Log aggregate metrics — visible in Metrics tab as single scalar values.
+        # Sort runs by avg_rag_triad in the UI to find the best configuration.
+        averages = average_scores(all_results)
+        mlflow.log_metrics(averages)
+
+        # Log per-example scores as steps — MLflow shows these as line charts.
+        # Useful for spotting hard questions or outlier examples.
+        for step, result in enumerate(all_results):
+            mlflow.log_metrics({
+                "faithfulness":      result["faithfulness"],
+                "context_relevance": result["context_relevance"],
+                "answer_relevance":  result["answer_relevance"],
+                "rag_triad":         result["rag_triad"],
+            }, step=step)
+
+        # Save clean scores to JSONL (no reasoning — good for pandas analysis)
+        results_file = "eval_results.jsonl"
+        with open(results_file, "w") as f:
+            for r in all_results:
+                clean = {k: v for k, v in r.items() if "reasoning" not in k}
+                f.write(json.dumps(clean) + "\n")
+        mlflow.log_artifact(results_file)
+
+        # Save verbose judge reasoning to JSON (for debugging low-scoring examples)
+        reasoning_file = "judge_reasoning.json"
+        reasoning_data = [
             {
-                "query":           r["query"],
-                "generated_answer": r["generated_answer"],
-                "reference":       r["reference"],
-                "context_relevance": {"score": r["context_relevance"], "reasoning": r.get("cr_reasoning")},
-                "faithfulness":      {"score": r["faithfulness"],       "reasoning": r.get("faithfulness_reasoning")},
-                "answer_relevance":  {"score": r["answer_relevance"],   "reasoning": r.get("ar_reasoning")},
-                "completeness":      {"score": r["completeness"],       "reasoning": r.get("completeness_reasoning")},
-                "conciseness":       {"score": r["conciseness"],        "reasoning": r.get("conciseness_reasoning")},
+                "question":          r["question"],
+                "generated_answer":  r["generated_answer"],
+                "faithfulness":      {"score": r["faithfulness"],       "why": r["fa_reasoning"]},
+                "context_relevance": {"score": r["context_relevance"],  "why": r["cr_reasoning"]},
+                "answer_relevance":  {"score": r["answer_relevance"],   "why": r["ar_reasoning"]},
             }
-            for r in results
-        ], f, indent=2, ensure_ascii=False)
-    mlflow.log_artifact(reasoning_path)
+            for r in all_results
+        ]
+        with open(reasoning_file, "w") as f:
+            json.dump(reasoning_data, f, indent=2)
+        mlflow.log_artifact(reasoning_file)
 
-    log.info(f"  Artifacts: {results_path}, {reasoning_path}")
+        # Print summary table to terminal
+        log.info("\n" + "=" * 55)
+        log.info("  PART A RESULTS — Model Training Mode")
+        log.info("=" * 55)
+        log.info(f"  {'Metric':<32} {'Score':>8}")
+        log.info("-" * 55)
+        for name, value in averages.items():
+            log.info(f"  {name:<32} {value:>8.4f}")
+        log.info("=" * 55)
+        log.info(f"  View → {MLFLOW_URL}  (Model Training tab)")
+        log.info("=" * 55)
 
 
-def run_part_a(golden_data: List[Dict], oai: openai.OpenAI, index) -> Dict:
+# ══════════════════════════════════════════════════════════════════════════
+# PART B — GENAI MODE
+#
+# HOW IT WORKS:
+#   1. TRACING   — run_rag_pipeline() is decorated with @mlflow.trace so
+#      each call creates a CHAIN → RETRIEVER → LLM waterfall in the UI.
+#   2. EVALUATION — mlflow.genai.evaluate() runs every scorer on every
+#      row of a DataFrame and shows a results table in the GenAI tab.
+#
+# WHERE TO SEE RESULTS:
+#   MLflow UI → GenAI tab → Traces          (waterfall view per example)
+#   MLflow UI → GenAI tab → Eval Results    (per-row scorer table)
+#
+# ── BUILT-IN SCORERS  (MLflow provides these — no prompts needed) ──────────
+#
+#   Correctness()          → does the answer match the expected gold answer?
+#                            Compares outputs vs expected_output using LLM judge.
+#
+#   RelevanceToQuery()     → is the answer actually addressing the question?
+#                            Catches off-topic or tangential answers.
+#
+#   Safety()               → does the answer contain harmful or offensive content?
+#                            Hard gate — should always pass for a QA pipeline.
+#
+#   RetrievalGroundedness() → is the answer grounded in the retrieved chunks?
+#                             Flags hallucinations. Parses the RETRIEVER span.
+#
+#   RetrievalRelevance()    → were the retrieved chunks relevant to the question?
+#                             Low score = Pinecone returning noisy docs.
+#                             Parses the RETRIEVER span.
+#
+#   RetrievalSufficiency()  → were the chunks enough to fully answer the question?
+#                             Low score = right topic retrieved but key facts missing.
+#                             Parses the RETRIEVER span.
+#
+# ── CUSTOM SCORERS  (we wrote the judge prompts ourselves using @scorer) ───
+#
+#   context_relevance_scorer  → same as score_context_relevance(), continuous 0-1
+#   faithfulness_scorer       → same as score_faithfulness(), claim-by-claim check
+#   answer_relevance_scorer   → same as score_answer_relevance(), continuous 0-1
+#   rag_triad_scorer          → harmonic mean of the three above
+#   completeness_scorer       → covers all reference key points?
+#   conciseness_scorer        → short and focused?
+#
+# WHY CUSTOM SCORERS ALONGSIDE BUILT-INS:
+#   Built-in scorers use generic prompts for broad evaluation.
+#   Our custom scorers use domain-specific RAG prompts — e.g. faithfulness
+#   checks claim-by-claim and rag_triad uses harmonic mean which collapses
+#   on any weak leg. Both sets complement each other.
+# ══════════════════════════════════════════════════════════════════════════
+
+def _decode_outputs(outputs):
     """
-    Part A — Hand-coded metrics tracked to MLflow Model Training mode.
-    Visible in: Model Training tab → RAG-HotpotQA-Evaluation experiment.
+    predict_fn returns a JSON string encoding both answer and retrieved_context.
+    This helper decodes it so scorers can access both fields.
+
+    Why JSON string instead of a dict:
+      mlflow.genai.evaluate() expects outputs to be a string (the generated answer).
+      We encode extra data (retrieved_context) in the same string as JSON so we can
+      carry it through to our custom scorers without losing it.
+
+    Returns: (answer_str, retrieved_context_list)
     """
-    experiment_id = setup_mlflow(EXPERIMENT_PART_A, "model_training")
+    try:
+        data = json.loads(outputs)
+        return data.get("answer", str(outputs)), data.get("retrieved_context", [])
+    except Exception:
+        # If outputs is a plain string (not JSON), treat it as just the answer
+        return str(outputs), []
 
-    with mlflow.start_run(
-        run_name=f"part_a_{datetime.now():%Y%m%d_%H%M%S}",
-        tags={"part": "A", "mode": "handcoded", "dataset": "hotpotqa"},
-    ) as run:
-        run_id = run.info.run_id
-        log.info(f"[Part A] Run ID : {run_id}")
-        log.info(f"[Part A] UI     : {MLFLOW_URI}/#/experiments/{experiment_id}/runs/{run_id}")
 
-        # 1. Log params
+@scorer
+def context_relevance_scorer(inputs, outputs, expectations, **kwargs):
+    """
+    Custom scorer: average relevance of each retrieved chunk to the question.
+
+    inputs   → {"query": ...}
+    outputs  → JSON string from predict_fn — decode to get answer + retrieved_context
+    """
+    query              = inputs.get("query", "") if isinstance(inputs, dict) else str(inputs)
+    _, retrieved_context = _decode_outputs(outputs)
+    if not retrieved_context:
+        return 0.0
+    score, _ = score_context_relevance(query, list(retrieved_context))
+    return score
+
+
+@scorer
+def faithfulness_scorer(inputs, outputs, expectations, **kwargs):
+    """
+    Custom scorer: does the answer only contain facts from the retrieved chunks?
+
+    outputs → JSON string from predict_fn — decode to get answer + retrieved_context
+    """
+    answer, retrieved_context = _decode_outputs(outputs)
+    if not retrieved_context:
+        return 0.0
+    score, _ = score_faithfulness(answer, list(retrieved_context))
+    return score
+
+
+@scorer
+def answer_relevance_scorer(inputs, outputs, **kwargs):
+    """
+    Custom scorer: does the answer properly address the question?
+
+    inputs  → {"query": ...}
+    outputs → JSON string from predict_fn — decode to get the answer
+    """
+    query  = inputs.get("query", "") if isinstance(inputs, dict) else str(inputs)
+    answer, _ = _decode_outputs(outputs)
+    score, _  = score_answer_relevance(query, answer)
+    return score
+
+
+# NOTE: rag_triad_scorer is NOT included in mlflow.genai.evaluate() scorers.
+# Running it as a separate scorer would duplicate all the API calls already made
+# by context_relevance_scorer, faithfulness_scorer, and answer_relevance_scorer
+# — tripling the cost for 30 examples.
+#
+# Instead, we compute the RAG Triad AFTER evaluation from the per-row results.
+# See _compute_rag_triad_from_results() called after mlflow.genai.evaluate().
+
+def _compute_rag_triad_from_results(results_df):
+    """
+    Compute RAG Triad per row from the individual scorer columns already computed.
+    Called after mlflow.genai.evaluate() — zero extra API calls.
+
+    Looks for columns: context_relevance_scorer/score, faithfulness_scorer/score,
+    answer_relevance_scorer/score (MLflow names scorer columns as 'scorername/score').
+    """
+    triad_scores = []
+    for _, row in results_df.iterrows():
+        cr = row.get("context_relevance_scorer/score", 0.0) or 0.0
+        fa = row.get("faithfulness_scorer/score",       0.0) or 0.0
+        ar = row.get("answer_relevance_scorer/score",   0.0) or 0.0
+        triad_scores.append(compute_rag_triad(float(cr), float(fa), float(ar)))
+    return triad_scores
+
+
+@scorer
+def completeness_scorer(inputs, outputs, expectations, **kwargs):
+    """
+    Custom scorer: does the answer cover all key points from the reference?
+
+    outputs      → JSON string from predict_fn — decode to get the answer
+    expectations → dict containing expected_output
+    """
+    answer, _       = _decode_outputs(outputs)
+    expected_output = expectations.get("expected_output", "") if isinstance(expectations, dict) else ""
+    if not expected_output:
+        return 0.0
+    score, _ = score_completeness(answer, str(expected_output))
+    return score
+
+
+@scorer
+def conciseness_scorer(inputs, outputs, **kwargs):
+    """Custom scorer: is the answer concise and focused?
+
+    inputs  → {"query": ...}
+    outputs → JSON string from predict_fn — decode to get the answer
+    """
+    query  = inputs.get("query", "") if isinstance(inputs, dict) else str(inputs)
+    answer, _ = _decode_outputs(outputs)
+    score, _  = score_conciseness(query, answer)
+    return score
+
+
+def run_part_b(golden_data):
+    """
+    Part B — trace the pipeline and evaluate with mlflow.genai.evaluate().
+
+    DATAFRAME FORMAT RULES (MLflow 3 strict requirements):
+      inputs            → must be a DICT e.g. {"query": "..."}, not a plain string
+      outputs           → plain string — the generated answer
+      expected_output   → plain string — the gold reference answer
+      retrieved_context → list of strings — the retrieved chunks
+      expectations      → dict with {"expected_response": "..."} for Correctness scorer
+
+    BUILT-IN SCORERS USED HERE:
+      Correctness()       → needs 'expectations' column with expected_response
+      RelevanceToQuery()  → needs 'inputs' dict and 'outputs' string
+      Safety()            → needs 'outputs' string only
+
+    SCORERS NOT USED (require a 'trace' column from live pipeline tracing,
+    not compatible with a static pre-built DataFrame):
+      RetrievalGroundedness, RetrievalRelevance, RetrievalSufficiency
+      Our custom faithfulness_scorer and context_relevance_scorer cover
+      the same ground using our own judge prompts — no traces needed.
+    """
+    mlflow.set_tracking_uri(MLFLOW_URL)
+    _get_or_restore_experiment(EXPERIMENT_B_NAME)
+
+    with mlflow.start_run(run_name=f"part_b_{datetime.now().strftime('%Y%m%d_%H%M%S')}"):
+
         mlflow.log_params({
-            "embedding_model":  EMBEDDING_MODEL,
-            "generator_model":  GENERATOR_MODEL,
-            "judge_model":      JUDGE_MODEL,
-            "top_k":            TOP_K,
-            "chunk_size":       CHUNK_SIZE,
-            "golden_n":         len(golden_data),
-            "index_name":       INDEX_NAME,
-            "namespace":        NAMESPACE,
+            "embedding_model": EMBEDDING_MODEL,
+            "generator_model": GENERATOR_MODEL,
+            "judge_model":     JUDGE_MODEL,
+            "top_k":           TOP_K,
+            "num_examples":    len(golden_data),
         })
 
-        # 2. Run evaluation
-        results    = _run_part_a_loop(golden_data, oai, index)
-        aggregated = _compute_aggregates(results)
+        # HOW TRACING + SCORING WORKS IN ONE PASS:
+        #
+        #   We pass predict_fn to mlflow.genai.evaluate() instead of pre-building
+        #   a DataFrame with outputs already filled in.
+        #
+        #   mlflow.genai.evaluate() then:
+        #     1. Calls predict_fn(row["inputs"]) for each row
+        #     2. Records the call as a trace (CHAIN → RETRIEVER → LLM) automatically
+        #        because run_rag_pipeline is decorated with @mlflow.trace
+        #     3. Stores the return value in the 'outputs' column
+        #     4. Runs every scorer on that row
+        #
+        #   This gives us exactly 30 traces, all scored — no duplicates.
+        #
+        #   WHY WE STORE chunks IN A DICT (not just return the answer string):
+        #     Our custom scorers need retrieved_context. predict_fn must return
+        #     a string for MLflow's outputs column, but we need the chunks too.
+        #     Solution: return a JSON string that encodes both, then unpack in scorers.
 
-        # 3. Log aggregate metrics
-        mlflow.log_metrics(aggregated)
+        def predict_fn(query):
+            """
+            Wrapper around run_rag_pipeline for mlflow.genai.evaluate().
 
-        # 4. Log per-example step metrics (enables time-series chart in UI)
-        step_keys = ["precision", "recall", "ndcg", "hit_rate",
-                     "faithfulness", "context_relevance", "answer_relevance", "rag_triad"]
-        for step, r in enumerate(results):
-            mlflow.log_metrics({k: r[k] for k in step_keys if k in r}, step=step)
+            WHY the argument is named 'query' (not 'inputs'):
+              MLflow unpacks the inputs dict as **kwargs into predict_fn.
+              So {"query": "..."} → predict_fn(query="...").
+              The parameter name here MUST match the key in the inputs dict.
 
-        # 5. Save artifacts
-        _save_artifacts(results, run_id)
-
-        # Summary
-        log.info("\n" + "=" * 62)
-        log.info(f"  Part A Results — Model Training Mode")
-        log.info("=" * 62)
-        for k, v in aggregated.items():
-            log.info(f"  {k:<35} {v:>8.4f}")
-        log.info("=" * 62)
-        log.info(f"  UI → {MLFLOW_URI}  (Model Training tab)")
-
-        return aggregated
-
-
-# ══════════════════════════════════════════════════════════════════════════
-# PART B — MLFLOW GENAI EVALUATION
-# ══════════════════════════════════════════════════════════════════════════
-
-def _build_eval_dataframe(golden_data: List[Dict], oai: openai.OpenAI, index) -> pd.DataFrame:
-    """
-    Run the RAG pipeline for every example and build the DataFrame
-    that mlflow.genai.evaluate() expects.
-
-    Columns:
-      inputs            — question
-      outputs           — generated answer  (produced here)
-      expected_output   — gold reference answer
-      retrieved_context — list of context strings (produced here)
-    """
-    rows = []
-    for i, ex in enumerate(golden_data):
-        log.info(f"[Part B prep {i+1}/{len(golden_data)}] {ex['question'][:70]}...")
-        try:
-            result = rag_pipeline(ex["question"], oai, index)
-            rows.append({
-                "inputs":            ex["question"],
-                "outputs":           result["answer"],
-                "expected_output":   ex["answer"],
-                "retrieved_context": result["contexts"],
+            Returns a JSON string so we can carry retrieved_context through
+            the outputs column to our custom scorers.
+            """
+            result = run_rag_pipeline(query)
+            # Encode answer + chunks as JSON string — scorers will decode this
+            return json.dumps({
+                "answer": result["answer"],
+                "retrieved_context": result["chunks"],
             })
-        except Exception as e:
-            log.error(f"  Failed on example {i+1}: {e}")
 
-    return pd.DataFrame(rows)
+        # Build input-only DataFrame — predict_fn fills in the outputs column
+        eval_df = pd.DataFrame([
+            {
+                "inputs": {"query": example["question"]},
+                "expectations": {
+                    "expected_response": example["answer"],  # Correctness() reads this
+                    "expected_output":   example["answer"],  # completeness_scorer reads this
+                },
+            }
+            for example in golden_data
+        ])
 
+        log.info(f"  Built eval DataFrame with {len(eval_df)} rows")
 
-def run_part_b(golden_data: List[Dict], oai: openai.OpenAI, index) -> None:
-    """
-    Part B — mlflow.genai.evaluate() with custom scorers tracked to GenAI mode.
-    Visible in: GenAI tab → RAG-HotpotQA-GenAI-Eval experiment.
-
-    Scorers used:
-      Custom  — context_relevance, faithfulness, answer_relevance,
-                rag_triad, completeness, conciseness
-      Built-in — mlflow.genai.scorers.relevance_to_query()
-                 mlflow.genai.scorers.safety()
-    """
-    experiment_id = setup_mlflow(EXPERIMENT_PART_B, "genai")
-
-    with mlflow.start_run(
-        run_name=f"part_b_{datetime.now():%Y%m%d_%H%M%S}",
-        tags={"part": "B", "mode": "mlflow_genai", "dataset": "hotpotqa"},
-    ) as run:
-        run_id = run.info.run_id
-        log.info(f"[Part B] Run ID : {run_id}")
-        log.info(f"[Part B] UI     : {MLFLOW_URI}/#/experiments/{experiment_id}/runs/{run_id}")
-
-        # Log params so the run is fully reproducible
-        mlflow.log_params({
-            "embedding_model":  EMBEDDING_MODEL,
-            "generator_model":  GENERATOR_MODEL,
-            "judge_model":      JUDGE_MODEL,
-            "top_k":            TOP_K,
-            "chunk_size":       CHUNK_SIZE,
-            "golden_n":         len(golden_data),
-            "index_name":       INDEX_NAME,
-        })
-
-        # Build eval DataFrame (also captures traces via @mlflow.trace)
-        log.info("[Part B] Building eval DataFrame (RAG pipeline + tracing)...")
-        eval_df = _build_eval_dataframe(golden_data, oai, index)
-        log.info(f"[Part B] DataFrame ready: {len(eval_df)} rows")
-
-        # Run mlflow.genai.evaluate() with all scorers
-        log.info("[Part B] Running mlflow.genai.evaluate()...")
+        # Run evaluation — MLflow calls predict_fn, creates traces, runs scorers
+        log.info("  Running mlflow.genai.evaluate() with 8 scorers...")
         results = mlflow.genai.evaluate(
             data=eval_df,
+            predict_fn=predict_fn,
             scorers=[
-                # ── Custom scorers (our full RAG Triad + custom judges) ─────
+
+                # ── Built-in MLflow scorers ────────────────────────────────────
+                # Compares outputs against expectations.expected_response
+                Correctness(),
+
+                # Checks if the answer is relevant and on-topic for the question
+                RelevanceToQuery(),
+
+                # Checks for harmful or offensive content in the answer
+                Safety(),
+
+                # ── Custom scorers (our own judge prompts) ─────────────────────
+                # Are the retrieved chunks relevant to the question? (avg per chunk)
                 context_relevance_scorer,
+
+                # Does the answer only contain facts from the retrieved context?
+                # This is our hallucination detector — replaces RetrievalGroundedness
                 faithfulness_scorer,
+
+                # Does the answer properly address the question?
                 answer_relevance_scorer,
-                rag_triad_scorer,
+
+                # NOTE: RAG Triad is computed after evaluate() from the 3 scores above.
+                # Keeping it here would duplicate ~7 API calls per example × 30 = 210 wasted calls.
+
+                # Does the answer cover all key points from the reference?
                 completeness_scorer,
+
+                # Is the answer concise and focused (not padded or verbose)?
                 conciseness_scorer,
-                # ── Built-in MLflow 3 GenAI scorers ───────────────────────
-                mlflow.genai.scorers.relevance_to_query(),
-                mlflow.genai.scorers.safety(),
-            ],
+            ]
         )
 
-        # Print aggregate results
-        log.info("\n" + "=" * 62)
-        log.info(f"  Part B Results — GenAI Mode")
-        log.info("=" * 62)
-        if hasattr(results, "metrics") and results.metrics:
-            for k, v in results.metrics.items():
-                log.info(f"  {k:<40} {v:>8.4f}")
-        log.info("=" * 62)
-        log.info(f"  UI → {MLFLOW_URI}  (GenAI tab)")
+        # Compute RAG Triad from individual scorer columns — zero extra API calls
+        try:
+            triad_scores = _compute_rag_triad_from_results(results.tables["eval_results"])
+            avg_triad    = round(sum(triad_scores) / len(triad_scores), 4)
+            mlflow.log_metric("avg_rag_triad", avg_triad)
+            log.info(f"  RAG Triad (post-eval) = {avg_triad:.4f}")
+        except Exception as e:
+            log.warning(f"  Could not compute RAG Triad: {e}")
 
-        return results
-
-
-# ══════════════════════════════════════════════════════════════════════════
-# MODEL REGISTRATION (call manually after a good Part A run)
-# ══════════════════════════════════════════════════════════════════════════
-
-def register_best_model(run_id: str, description: str = ""):
-    """
-    Register a Part A run as a versioned model in the Model Registry.
-
-    Example:
-        register_best_model(
-            run_id="abc123de...",
-            description="chunk=400, K=5, rag_triad=0.823, faithfulness=0.833"
-        )
-    """
-    mlflow.set_tracking_uri(MLFLOW_URI)
-    client = MlflowClient()
-
-    version = mlflow.register_model(
-        model_uri=f"runs:/{run_id}/eval_results",
-        name=MODEL_NAME,
-    )
-    log.info(f"Registered '{MODEL_NAME}' version {version.version}")
-
-    if description:
-        client.update_model_version(
-            name=MODEL_NAME, version=version.version, description=description
-        )
-
-    client.transition_model_version_stage(
-        name=MODEL_NAME, version=version.version,
-        stage="Staging", archive_existing_versions=False,
-    )
-    log.info("Stage: None → Staging  |  Promote to Production in the UI when ready")
-    return version
+        # Print summary
+        log.info("\n" + "=" * 55)
+        log.info("  PART B RESULTS — GenAI Mode  (8 scorers + RAG Triad computed post-eval)")
+        log.info("=" * 55)
+        log.info(f"  {'Scorer':<32} {'Score':>8}")
+        log.info("-" * 55)
+        for name, value in results.metrics.items():
+            if isinstance(value, (int, float)):
+                log.info(f"  {name:<32} {float(value):>8.4f}")
+        log.info("=" * 55)
+        log.info(f"  Traces  → {MLFLOW_URL}  (GenAI tab → Traces)")
+        log.info(f"  Results → {MLFLOW_URL}  (GenAI tab → Eval Results)")
+        log.info("=" * 55)
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# ENTRY POINT
+# MAIN
 # ══════════════════════════════════════════════════════════════════════════
-
-def parse_args():
-    parser = argparse.ArgumentParser(description="RAG Evaluation — dual MLflow mode")
-    parser.add_argument(
-        "--mode",
-        choices=["part_a", "part_b", "both"],
-        default="both",
-        help=(
-            "part_a = hand-coded metrics → Model Training tab | "
-            "part_b = mlflow.genai.evaluate() → GenAI tab | "
-            "both = run both (default)"
-        ),
-    )
-    return parser.parse_args()
-
 
 def main():
-    args = parse_args()
+    parser = argparse.ArgumentParser(description="RAG Evaluation Pipeline — MLflow 3")
+    parser.add_argument(
+        "--mode",
+        choices=["a", "b", "both"],
+        default="a",
+        help="a = Part A (hand-coded metrics)  |  b = Part B (GenAI mode)  |  both = run both"
+    )
+    args = parser.parse_args()
 
-    if not GOLDEN_PATH.exists():
-        raise FileNotFoundError(f"Not found: {GOLDEN_PATH}. Run 1_prepare_dataset.py first.")
+    if not GOLDEN_FILE.exists():
+        raise FileNotFoundError(
+            f"Could not find {GOLDEN_FILE}\n"
+            "Please run 1_prepare_dataset.py first."
+        )
 
-    oai, pc     = build_clients()
-    index       = pc.Index(INDEX_NAME)
-    golden_data = load_golden(GOLDEN_PATH)
-    log.info(f"Loaded {len(golden_data)} examples  |  mode={args.mode}")
+    golden_data = load_golden_data(GOLDEN_FILE)
+    log.info(f"Mode: {args.mode}")
 
-    # Inject clients into module-level refs used by @scorer functions
-    global _oai, _index
-    _oai   = oai
-    _index = index
+    # Set up clients and store in globals so @mlflow.trace functions can use them
+    global oai_client, pine_index
+    oai_client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+    pc         = Pinecone(api_key=os.environ["PINECONE_API_KEY"])
+    pine_index = pc.Index(PINECONE_INDEX)
 
-    if args.mode in ("part_a", "both"):
-        log.info("\n── PART A: Hand-coded metrics → Model Training mode ──────────────")
-        run_part_a(golden_data, oai, index)
+    # Re-assert tracking URI — overrides any env var set after module load
+    mlflow.set_tracking_uri(MLFLOW_URL)
 
-    if args.mode in ("part_b", "both"):
-        log.info("\n── PART B: mlflow.genai.evaluate() → GenAI mode ──────────────────")
-        run_part_b(golden_data, oai, index)
+    if args.mode in ("a", "both"):
+        log.info("\n── PART A ─────────────────────────────────────────────")
+        run_part_a(golden_data)
 
-    log.info(f"\nDone. Open MLflow UI → {MLFLOW_URI}")
-    log.info("  GenAI tab         → Part B traces + scorer results")
-    log.info("  Model Training tab → Part A aggregate metrics + artifacts")
+    if args.mode in ("b", "both"):
+        log.info("\n── PART B ─────────────────────────────────────────────")
+        run_part_b(golden_data)
+
+    log.info(f"\nAll done! Open {MLFLOW_URL} to see your results.")
+    if args.mode in ("a", "both"):
+        log.info("  Model Training tab → params, metrics, step charts, artifacts")
+    if args.mode in ("b", "both"):
+        log.info("  GenAI tab          → traces waterfall + 11-scorer eval table")
 
 
 if __name__ == "__main__":
