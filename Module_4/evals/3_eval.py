@@ -108,8 +108,8 @@ EXPERIMENT_B_NAME = "RAG-HotpotQA-GenAI-Eval-v5"    # Part B → GenAI tab
 PINECONE_INDEX    = "hotpotqa-ragbench-mini"
 PINECONE_NS       = "hotpotqa"
 EMBEDDING_MODEL   = "text-embedding-3-large"
-GENERATOR_MODEL   = "gpt-4o-mini"
-JUDGE_MODEL       = "gpt-4o-mini"
+GENERATOR_MODEL   = "gpt-5"
+JUDGE_MODEL       = "gpt-5"
 TOP_K             = 5      # how many chunks to retrieve per question
 CHUNK_SIZE        = 400    # logged as a param so we can compare runs later
 
@@ -226,7 +226,7 @@ def generate_answer(question, chunks):
 
     response = oai_client.chat.completions.create(
         model=GENERATOR_MODEL,
-        temperature=0,   # deterministic output for reproducible evaluation
+        #temperature=0,   # deterministic output for reproducible evaluation
         messages=[
             {
                 "role": "system",
@@ -395,7 +395,7 @@ def ask_judge(prompt):
     """
     response = oai_client.chat.completions.create(
         model=JUDGE_MODEL,
-        temperature=0,
+        #temperature=0,
         response_format={"type": "json_object"},
         messages=[{"role": "user", "content": prompt}]
     )
@@ -1042,7 +1042,7 @@ def run_part_b(golden_data):
             }
             for example in golden_data
         ])
-
+        print(eval_df)
         log.info(f"  Built eval DataFrame with {len(eval_df)} rows")
 
         # Run evaluation — MLflow calls predict_fn, creates traces, runs scorers
@@ -1072,9 +1072,6 @@ def run_part_b(golden_data):
 
                 # Does the answer properly address the question?
                 answer_relevance_scorer,
-
-                # NOTE: RAG Triad is computed after evaluate() from the 3 scores above.
-                # Keeping it here would duplicate ~7 API calls per example × 30 = 210 wasted calls.
 
                 # Does the answer cover all key points from the reference?
                 completeness_scorer,
