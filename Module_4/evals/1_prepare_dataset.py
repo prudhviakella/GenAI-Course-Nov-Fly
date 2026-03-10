@@ -2,8 +2,18 @@
 RAGBench (HotpotQA) Dataset Loader for RAG Evaluation
 -----------------------------------------------------
 Produces two files:
-  1. golden_hotpotqa_30.jsonl   — 30 examples for evaluation (questions + gold answers + contexts)
-  2. rag_corpus_hotpotqa_500.jsonl — 500 document chunks to populate Pinecone
+  1. golden_hotpotqa_30.jsonl      — 30 examples for evaluation
+                                     (questions + gold answers + contexts + context_ids)
+  2. rag_corpus_hotpotqa_500.jsonl — 500 document records to populate Pinecone
+
+ID contract
+-----------
+Corpus record ID : {example_id}_d{doc_index}    e.g. "5ae7473f5542991bbc9761d2_d0"
+Pinecone ID      : same — docs are embedded as-is, no sub-chunking applied.
+
+context_ids in the golden dataset are therefore exact Pinecone IDs.
+Evaluator match logic is simple equality:
+    retrieved_id in set(context_ids)
 
 Run:
   pip install datasets
@@ -45,10 +55,10 @@ def as_text_list(documents: Optional[List], documents_sentences: Optional[List] 
     RAGBench shapes we handle:
       • list[str]           — already plain text
       • list[dict]          — dicts with 'text'/'content'/… keys or a 'sentences' list
-      • list[list[str]]     — sentences grouped by document (FIX: was silently dropped before)
+      • list[list[str]]     — sentences grouped by document
       • fallback to documents_sentences if nothing else works
     """
-    if not documents:                           # None or empty list → skip
+    if not documents:
         return []
 
     first = documents[0]
@@ -57,7 +67,7 @@ def as_text_list(documents: Optional[List], documents_sentences: Optional[List] 
     if isinstance(first, str):
         return [d for d in documents if isinstance(d, str) and d.strip()]
 
-    # Case B: list of lists of strings (e.g. sentences per doc)  ← BUG FIX
+    # Case B: list of lists of strings (e.g. sentences per doc)
     if isinstance(first, list):
         return [
             " ".join(s for s in doc if isinstance(s, str) and s.strip())
@@ -72,9 +82,10 @@ def as_text_list(documents: Optional[List], documents_sentences: Optional[List] 
         for d in documents:
             if not isinstance(d, dict):
                 continue
-            # Try well-known text keys first
-            txt = next((d[k].strip() for k in candidate_keys if k in d and isinstance(d[k], str) and d[k].strip()), None)
-            # Fallback: 'sentences' list inside the dict
+            txt = next(
+                (d[k].strip() for k in candidate_keys if k in d and isinstance(d[k], str) and d[k].strip()),
+                None,
+            )
             if txt is None and isinstance(d.get("sentences"), list):
                 txt = " ".join(s for s in d["sentences"] if isinstance(s, str) and s.strip())
             if txt:
@@ -102,7 +113,6 @@ def make_id(row: dict, idx: int) -> str:
     raw = row.get("id")
     if raw is not None:
         return str(raw)
-    # FIX: original code silently stored None when 'id' was absent
     return f"row_{idx}"
 
 
@@ -117,11 +127,20 @@ log.info(f"Writing golden dataset ({golden_n} examples) → {GOLDEN_PATH}")
 
 with GOLDEN_PATH.open("w", encoding="utf-8") as f:
     for i, row in enumerate(ds.select(range(golden_n))):
+        ex_id    = make_id(row, i)
+        contexts = as_text_list(row.get("documents"), row.get("documents_sentences"))
+
+        # context_ids are the exact Pinecone vector IDs for this example's docs.
+        # No sub-chunking is applied during ingestion, so the corpus record ID
+        # "{ex_id}_d{k}" IS the Pinecone ID — direct equality match at eval time.
+        context_ids = [f"{ex_id}_d{k}" for k in range(len(contexts))]
+
         item = {
-            "id":           make_id(row, i),
+            "id":           ex_id,
             "input":        row.get("question", ""),
             "reference":    row.get("response", ""),
-            "contexts":     as_text_list(row.get("documents"), row.get("documents_sentences")),
+            "contexts":     contexts,
+            "context_ids":  context_ids,   # exact Pinecone IDs for Recall/Precision/F1
             "dataset_name": row.get("dataset_name", CONFIG),
             "source":       f"{DS_NAME}/{CONFIG}",
         }
@@ -140,12 +159,14 @@ with CORPUS_PATH.open("w", encoding="utf-8") as f:
         ex_id = make_id(row, i)
         docs  = as_text_list(row.get("documents"), row.get("documents_sentences"))
 
-        if not docs:                            # FIX: skip rows with no usable text
+        if not docs:
             log.warning(f"Row {i} (id={ex_id}) produced no document text — skipping")
             continue
 
         for k, doc_text in enumerate(docs):
             rec = {
+                # This ID is used as-is as the Pinecone vector ID.
+                # Must match context_ids[k] in the golden dataset exactly.
                 "id":   f"{ex_id}_d{k}",
                 "text": trunc(doc_text),
                 "metadata": {
