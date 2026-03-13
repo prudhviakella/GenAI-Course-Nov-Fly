@@ -363,23 +363,23 @@ for key, value in run_data.data.tags.items():
         print(f"    {key:<20} = {value}")
 #
 #
-# # ══════════════════════════════════════════════════════════════════════════════
-# # SUMMARY
-# # ══════════════════════════════════════════════════════════════════════════════
-#
-# print("\n" + "═" * 60)
-# print("  All done! Open the MLflow UI to explore results:")
-# print(f"  → {TRACKING_URI}")
-# print()
-# print("  What to look at in the UI:")
-# print("  ┌──────────────────────────────────────────────────────┐")
-# print("  │  Experiments list    → select 'mlflow-capabilities-  │")
-# print("  │                         demo'                        │")
-# print("  │  Runs table          → see params + final metrics    │")
-# print("  │  Run detail page:                                     │")
-# print("  │    Params tab        → all log_param / log_params    │")
-# print("  │    Metrics tab       → scalar + step-chart metrics   │")
-# print("  │    Tags tab          → all set_tag values            │")
-# print("  │    Artifacts tab     → CSV, TXT, JSON, PNG files     │")
-# print("  └──────────────────────────────────────────────────────┘")
-# print("═" * 60 + "\n")
+# ══════════════════════════════════════════════════════════════════════════════
+# SUMMARY
+# ══════════════════════════════════════════════════════════════════════════════
+
+print("\n" + "═" * 60)
+print("  All done! Open the MLflow UI to explore results:")
+print(f"  → {TRACKING_URI}")
+print()
+print("  What to look at in the UI:")
+print("  ┌──────────────────────────────────────────────────────┐")
+print("  │  Experiments list    → select 'mlflow-capabilities-  │")
+print("  │                         demo'                        │")
+print("  │  Runs table          → see params + final metrics    │")
+print("  │  Run detail page:                                     │")
+print("  │    Params tab        → all log_param / log_params    │")
+print("  │    Metrics tab       → scalar + step-chart metrics   │")
+print("  │    Tags tab          → all set_tag values            │")
+print("  │    Artifacts tab     → CSV, TXT, JSON, PNG files     │")
+print("  └──────────────────────────────────────────────────────┘")
+print("═" * 60 + "\n")
