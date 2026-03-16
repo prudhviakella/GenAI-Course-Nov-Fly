@@ -127,7 +127,7 @@ class BedrockPromptManager:
         description: str,
         prompt_text: str,
         variables: List[str],
-        model_id: str = "us.amazon.nova-lite-v1:0",
+        model_id: str = "amazon.nova-2-lite-v1:0",
         temperature: float = 0.7,
         max_tokens: int = 1000
     ) -> Dict[str, Any]:
@@ -712,7 +712,7 @@ def example_1_create_and_use():
         Keep it under 100 words.
         """,
         variables=["customer_name", "product_name"],
-        model_id="us.amazon.nova-lite-v1:0"  # Amazon Nova - No subscription needed
+        model_id="amazon.nova-2-sonic-v1:0"  # Amazon Nova - No subscription needed
     )
     print("create_prompt response",result)
     if result['success']:
@@ -895,13 +895,13 @@ if __name__ == "__main__":
         try:
             example_1_create_and_use()
             print("\n" + "-"*80)
-            example_2_list_and_details()
-            print("\n" + "-"*80)
-            example_3_versioning()
-            #
-            print("\n" + "="*80)
-            print("All examples completed")
-            print("="*80)
+            # example_2_list_and_details()
+            # print("\n" + "-"*80)
+            # example_3_versioning()
+            # #
+            # print("\n" + "="*80)
+            # print("All examples completed")
+            # print("="*80)
         except Exception as e:
             print(f"\n\nError: {str(e)}")
     else:
