@@ -49,6 +49,7 @@ from requests import get
 
 mcp = FastMCP("mcp_server")
 
+
 # Tavily client for web search — reads TAVILY_API_KEY from env
 tavily_client = TavilyClient()
 
@@ -96,7 +97,7 @@ def search_web(query: str) -> Dict[str, Any]:
 # Note: the URL in the implementation uses 'blob' which may need
 # to be 'refs/heads' for the GitHub raw API — check if you get 404s.
 
-@mcp.resource("github://langchain-ai/langchain-mcp-adapters/blob/main/README.md")
+@mcp.resource("https://raw.githubusercontent.com/langchain-ai/langchain-mcp-adapters/blob/main/README.md")
 def github_file():
     """
     Resource for accessing langchain-ai/langchain-mcp-adapters/README.md file
@@ -162,4 +163,4 @@ def prompt():
 # For an HTTP server you would use transport="http" instead.
 
 if __name__ == "__main__":
-    mcp.run(transport="stdio")
+    mcp.run(transport="streamable-http")
